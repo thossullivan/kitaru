@@ -8470,6 +8470,11 @@ export interface components {
          * @description Server info response.
          */
         ServerInfoResponse: {
+            /**
+             * Analytics Enabled
+             * @description Whether the server sends analytics events.
+             */
+            analytics_enabled?: boolean | null;
             /** @description Scheme used to authenticate requests. */
             auth_scheme: components["schemas"]["AuthScheme"];
             /**
