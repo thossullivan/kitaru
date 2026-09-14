@@ -32,6 +32,7 @@ from kitaru.api_models.v1.session import (
     TokenUsage,
 )
 from kitaru.api_models.v1.session_node import (
+    NodeLink,
     NodeStatus,
     NodeType,
     SessionNodeBatchRequest,
@@ -88,10 +89,9 @@ class ImportedNode(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    index: int | None = None
-    parent_index: int | None = None
-    secondary_parent_indexes: list[int] = Field(default_factory=list)
-    external_id: str | None = None
+    external_id: str
+    parent_external_id: str | None = None
+    links: list[NodeLink] = Field(default_factory=list)
     trace_id: str | None = None
     node_type: NodeType
     name: str
@@ -363,14 +363,13 @@ def session_request(
 
 
 def _node_request(
-    node: ImportedNode, *, index: int, parent_index: int | None
+    node: ImportedNode, parent_external_id: str | None
 ) -> SessionNodeCreateRequest:
     """Convert an imported node to an ingest request."""
     return SessionNodeCreateRequest(
-        index=index,
-        parent_index=parent_index,
-        secondary_parent_indexes=node.secondary_parent_indexes,
         external_id=node.external_id,
+        parent_external_id=parent_external_id,
+        links=node.links,
         trace_id=node.trace_id,
         node_type=node.node_type,
         name=node.name,
@@ -397,53 +396,57 @@ def _node_request(
     )
 
 
+def _reject_duplicate_external_ids(external_ids: Iterable[str]) -> None:
+    """Raise SessionImportError when an external id repeats within a session."""
+    seen: set[str] = set()
+    for external_id in external_ids:
+        if external_id in seen:
+            raise SessionImportError(
+                f"Imported node external id '{external_id}' is not unique "
+                "within the session"
+            )
+        seen.add(external_id)
+
+
 def flatten_nodes(nodes: list[ImportedNode]) -> list[SessionNodeCreateRequest]:
-    """Flatten an imported node tree into indexed ingest requests, depth-first.
+    """Flatten imported nodes into ingest requests, depth-first.
+
+    A top-level node names its parent by ``parent_external_id`` and a nested
+    node's parent is the node it nests under.
 
     Args:
         nodes: Top-level imported nodes.
 
+    Raises:
+        SessionImportError: The node tree contains a cycle, a nested node
+            names a parent, or an external id repeats within the session.
+
     Returns:
         Flat session node create requests in depth-first order.
     """
-    explicit_indexes = [node.index is not None for node in nodes]
-    if any(explicit_indexes):
-        if not all(explicit_indexes) or any(node.children for node in nodes):
-            raise SessionImportError(
-                "Indexed imported nodes must all have indexes and cannot have children"
-            )
-        indexed_nodes = sorted(
-            nodes, key=lambda node: node.index if node.index is not None else -1
-        )
-        direct = [
-            _node_request(
-                node,
-                index=node.index,
-                parent_index=node.parent_index,
-            )
-            for node in indexed_nodes
-            if node.index is not None
-        ]
-        return SessionNodeBatchRequest(nodes=direct).nodes
-
     flattened: list[SessionNodeCreateRequest] = []
 
     active: set[int] = set()
-    stack: list[tuple[ImportedNode, int | None, bool]] = [
-        (node, None, False) for node in reversed(nodes)
+    stack: list[tuple[ImportedNode, str | None, bool]] = [
+        (node, node.parent_external_id, False) for node in reversed(nodes)
     ]
     while stack:
-        node, parent_index, exiting = stack.pop()
+        node, parent_external_id, exiting = stack.pop()
         if exiting:
             active.remove(id(node))
             continue
         if id(node) in active:
             raise SessionImportError("Imported node tree contains a cycle")
         active.add(id(node))
-        index = len(flattened)
-        flattened.append(_node_request(node, index=index, parent_index=parent_index))
-        stack.append((node, parent_index, True))
-        stack.extend((child, index, False) for child in reversed(node.children))
+        flattened.append(_node_request(node, parent_external_id))
+        stack.append((node, parent_external_id, True))
+        for child in reversed(node.children):
+            if child.parent_external_id is not None:
+                raise SessionImportError(
+                    "Imported node nested under a parent cannot name another parent"
+                )
+            stack.append((child, node.external_id, False))
+    _reject_duplicate_external_ids(request.external_id for request in flattened)
     return flattened
 
 
@@ -479,13 +482,20 @@ async def ingest_session(
         if exc.status_code == httpx.codes.CONFLICT:
             return None
         raise
-    nodes = flatten_nodes(parsed.nodes)
-    for start in range(0, len(nodes), NODE_BATCH_SIZE):
-        batch = nodes[start : start + NODE_BATCH_SIZE]
-        await client.sessions.ingest_nodes(
-            session.id, SessionNodeBatchRequest(nodes=batch)
-        )
+    await _ingest_nodes(client, session.id, parsed.nodes)
     return session
+
+
+async def _ingest_nodes(
+    client: KitaruAPIClient, session_id: uuid.UUID, nodes: list[ImportedNode]
+) -> None:
+    """Flatten imported nodes and ingest them into a session in batches."""
+    requests = flatten_nodes(nodes)
+    for start in range(0, len(requests), NODE_BATCH_SIZE):
+        batch = requests[start : start + NODE_BATCH_SIZE]
+        await client.sessions.ingest_nodes(
+            session_id, SessionNodeBatchRequest(nodes=batch)
+        )
 
 
 def _resolve_importer(details: ImportTaskDetails) -> tuple[Parser, Fetcher | None]:
@@ -575,6 +585,7 @@ async def run(client: KitaruAPIClient, task_id: str) -> None:
 
     created = 0
     skipped = 0
+    session_ids: dict[str, uuid.UUID] = {}
     failed = 0
     limit_reached = False
     failures: list[ImportFailure] = []
@@ -606,6 +617,13 @@ async def run(client: KitaruAPIClient, task_id: str) -> None:
                     limit_reached = True
                     break
                 try:
+                    # A session this run already created takes the nodes of a
+                    # repeated item instead of being created again.
+                    session_id = session_ids.get(item.external_id)
+                    if session_id is not None:
+                        await _ingest_nodes(client, session_id, item.nodes)
+                        skipped += 1
+                        continue
                     session = await ingest_session(
                         client, item, details.agent_id, details.provider
                     )
@@ -620,6 +638,7 @@ async def run(client: KitaruAPIClient, task_id: str) -> None:
                     skipped += 1
                 else:
                     created += 1
+                    session_ids[item.external_id] = session.id
             if limit_reached:
                 break
     except SessionImportError as exc:
