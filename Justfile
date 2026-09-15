@@ -96,12 +96,16 @@ fix:
 test *ARGS:
     uv run pytest {{ ARGS }}
 
-# Run the property-test suites currently scheduled nightly
-fuzz: fuzz-importers fuzz-mcp fuzz-filters fuzz-api
+# Run all property tests with the heavy nightly profile
+fuzz: fuzz-importers fuzz-evaluators fuzz-mcp fuzz-filters fuzz-api
 
 # Heavy property-test run for the plugins tree (importer parse() contract, LangGraph capture)
 fuzz-importers:
     HYPOTHESIS_PROFILE=nightly uv run --project plugins pytest -c plugins/pyproject.toml plugins/tests/importers/test_fuzz_parse.py plugins/tests/adapters/langgraph/test_capture_properties.py --hypothesis-show-statistics
+
+# Heavy property-test run for deterministic evaluator pointer and arithmetic contracts
+fuzz-evaluators:
+    HYPOTHESIS_PROFILE=nightly uv run --project plugins pytest -c plugins/pyproject.toml plugins/tests/evaluators/test_deterministic_properties.py --hypothesis-show-statistics
 
 # Heavy property-test run for the core tree (MCP tool boundary, credential redaction)
 fuzz-mcp:
