@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Emit `reasoning_selectors` pointing at visible reasoning in the span output instead of extracted `reasoning` text.
+- Report one conflict failure for inconsistent copies of a trace regardless of export order.
 
 ### Release context
 
