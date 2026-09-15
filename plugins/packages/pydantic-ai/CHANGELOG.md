@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Support PydanticAI 2.41 through 2.43 in addition to the existing 2.14 through 2.40 minor lines.
 - Emit `reasoning_selectors` pointing at every `ThinkingPart` in node outputs instead of extracted `reasoning` text.
 
 ### Release context
