@@ -1,11 +1,12 @@
 {
-  "$schema": "https://biomejs.dev/schemas/2.3.11/schema.json",
+  "$schema": "https://biomejs.dev/schemas/2.5.13/schema.json",
   "files": {
     "includes": [
       "packages/core/**",
       "packages/mastra/**",
       "packages/vercel-ai/**",
       "examples/typescript/mastra_support_triage/**",
+      "examples/typescript/mastra_adaptive_conversation/**",
       "examples/typescript/vercel_ai_support_triage/**",
       "!packages/core/src/generated/**",
       "!**/dist/**"
@@ -18,7 +19,7 @@
   "linter": {
     "enabled": true,
     "rules": {
-      "recommended": true
+      "preset": "recommended"
     }
   }
 }

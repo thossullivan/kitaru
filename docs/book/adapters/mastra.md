@@ -8,7 +8,7 @@ icon: robot
 The Kitaru Mastra adapter wraps an existing Mastra `Agent` and records each non-streaming `generate()` call as a Kitaru [session](../concepts/agents-and-sessions.md). Mastra still runs the agent and Kitaru returns the native Mastra result unchanged.
 
 {% hint style="warning" %}
-`@zenml-io/kitaru-mastra` 0.1.0 is the initial stable package release for Node `>=22.22.0 <23` and `@mastra/core >=1.51.0 <1.52.0`. It supports non-streaming `Agent.generate()` only.
+`@zenml-io/kitaru-mastra` supports Node `>=22.22.0 <23` and `@mastra/core >=1.51.0 <1.67.0`. It supports non-streaming `Agent.generate()` only.
 {% endhint %}
 
 To bring in runs already recorded by Mastra, use [Import existing Mastra traces](#import-existing-mastra-traces). Importing an export does not require the original run to have used `KitaruAgent`.
@@ -18,13 +18,13 @@ To bring in runs already recorded by Mastra, use [Import existing Mastra traces]
 {% tabs %}
 {% tab title="pnpm" %}
 ```bash
-pnpm add @zenml-io/kitaru-mastra @mastra/core@1.51.0
+pnpm add @zenml-io/kitaru-mastra @mastra/core@1.66.0
 ```
 {% endtab %}
 
 {% tab title="npm" %}
 ```bash
-npm install @zenml-io/kitaru-mastra @mastra/core@1.51.0
+npm install @zenml-io/kitaru-mastra @mastra/core@1.66.0
 ```
 {% endtab %}
 {% endtabs %}
@@ -145,7 +145,20 @@ const result = await recordedAgent.generate(messages, {
 console.log(result.object);
 ```
 
-`structuredOutput.model` is rejected before execution. Mastra 1.51 implements that option with a second internal model call which is not exposed through the parent agent's public callbacks, so Kitaru cannot record it completely.
+A separate structuring model can be supplied in the per-run options:
+
+```ts
+const result = await recordedAgent.generate(messages, {
+  structuredOutput: {
+    schema: supportDecisionSchema,
+    model: "openai/gpt-5-nano",
+  },
+});
+```
+
+Kitaru records each secondary provider attempt as a separate model node with its own model identity, bounded input and output, usage, and failure status. Mastra still validates the schema and returns its native `result.object`. A successful provider call can be followed by a schema validation failure, in which case the model node contains the returned text and the run is marked failed.
+
+Replay model and model-setting overrides affect the parent agent only. The secondary model stays configured in the entrypoint and executes again against the parent's new output. Agent-default secondary models, `useAgent: true`, and `errorStrategy: "warn"` or `"fallback"` remain unsupported and are rejected before execution. Move a default secondary model into the per-run options and use the default strict error strategy.
 
 ## Worker setup
 
@@ -153,17 +166,21 @@ Compile the agent into a Node command, register that command as the agent versio
 
 The same entrypoint records a baseline session and executes replay jobs. Do not set replay environment variables manually around concurrent calls because environment variables are process-wide.
 
+## Evaluation
+
+Run native Mastra scorers against stored and replayed sessions with the [TypeScript evaluator bridge](../guides/typescript-evaluators.md). Supply an explicit mapping from the recorded session to your scorer input and deploy a pinned Node artifact on the worker.
+
 ## Supported boundary
 
-Version 0.1.0 supports:
+The adapter supports:
 
 - Non-streaming `Agent.generate()` calls.
 - Local function tools, including function-valued tools resolved from the run's `requestContext`.
 - Per-run model, system-instruction, model-setting, and input overrides.
 - Passthrough, static, and same-adapter history tool policies.
-- Schema-only structured output.
+- Schema-only structured output and per-run secondary structuring models with strict validation.
 
-It does not support streaming, workflows, subagents, MCP tools, provider-native tool replay, dynamic instructions, `prepareStep`, input processors, LLM tool policy, or TypeScript evaluators. `prepareStep` and input processors are rejected during replay because they can replace the model, prompt, or tools after policy preflight.
+It does not support streaming, workflows, subagents, MCP tools, provider-native tool replay, dynamic instructions, `prepareStep`, input processors, or LLM tool policy. `prepareStep` and input processors are rejected during replay because they can replace the model, prompt, or tools after policy preflight.
 
 ## Import existing Mastra traces
 
@@ -233,7 +250,7 @@ The worker calls the model again with the saved context. A matching tool call re
 
 ### Identity and limits
 
-Reimporting a trace skips the existing session rather than updating it. Keep `source_namespace` stable for one source deployment; it distinguishes deployments that might reuse trace IDs. Changing parameters alone does not upgrade a default import into a replay snapshot. If you already imported the trace without replay context, use a new explicit namespace to create a separate replay-ready copy.
+Reimporting a trace skips the existing session rather than updating it. Keep `source_namespace` stable for one source deployment. It distinguishes deployments that might reuse trace IDs. Changing parameters alone does not upgrade a default import into a replay snapshot. If you already imported the trace without replay context, use a new explicit namespace to create a separate replay-ready copy.
 
 The importer accepts selected files only; it does not fetch traces or live memory. It preserves usage reported by the export without counting generation totals twice, and imports monetary cost only when the source explicitly identifies USD. Missing usage and cost remain missing. Malformed traces produce isolated import failures while valid neighboring traces continue. See [Importing sessions](../guides/importing-sessions.md) for import counts and failure inspection.
 
