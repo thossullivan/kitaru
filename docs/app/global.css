@@ -65,7 +65,8 @@ html {
 }
 
 body {
-  font-family: var(--font-dm-sans), "DM Sans", -apple-system, sans-serif;
+  font-family:
+    var(--font-rethink-sans), "Rethink Sans", -apple-system, sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
@@ -99,8 +100,8 @@ kbd,
 pre,
 .font-mono {
   font-family:
-    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
-    "Courier New", monospace;
+    var(--font-jetbrains-mono), "JetBrains Mono", ui-monospace, SFMono-Regular,
+    Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
 }
 
 /* ═══════════════════════════════════════════════════
@@ -169,28 +170,6 @@ figure:has(> pre) code span {
   border-radius: 4px;
   font-size: 0.85em;
   border: 1px solid #e5e2dc;
-}
-
-/* ═══════════════════════════════════════════════════
-   Logo Ring Animation
-   ═══════════════════════════════════════════════════ */
-
-@keyframes ring-spin {
-  from {
-    transform: rotate(0deg);
-  }
-  to {
-    transform: rotate(360deg);
-  }
-}
-
-.logo-ring {
-  transform-origin: 85px 85px;
-  animation: ring-spin 12s linear infinite;
-}
-
-.nav-title:hover .logo-ring {
-  animation-duration: 3s;
 }
 
 /* ═══════════════════════════════════════════════════
