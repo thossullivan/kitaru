@@ -17,7 +17,9 @@ import uuid
 from types import SimpleNamespace
 from typing import Any
 
+import braintrust
 import pytest
+from braintrust.test_helpers import init_test_logger
 
 from kitaru import importer_adapter
 from kitaru.api_models.v1.session import (
@@ -125,6 +127,47 @@ def test_trace_requires_an_active_braintrust_logger(
 
     assert "func" not in fake_braintrust.events
     assert client.sessions.created == []
+
+
+@pytest.fixture
+def real_braintrust_sdk(
+    with_memory_logger: Any, monkeypatch: pytest.MonkeyPatch
+) -> Any:
+    """Keep the real SDK in the adapter, logging to memory offline."""
+    # init_test_logger overwrites this module global without restoring it.
+    monkeypatch.setattr(
+        braintrust.logger,
+        "_compute_logger_metadata",
+        braintrust.logger._compute_logger_metadata,
+    )
+    return with_memory_logger
+
+
+def test_real_sdk_reports_no_active_logger(real_braintrust_sdk: Any) -> None:
+    """Reject a trace when the real SDK returns its no-op span."""
+    with (
+        pytest.raises(RuntimeError, match="No active Braintrust logger"),
+        BraintrustAdapter().open_trace(),
+    ):
+        pass
+
+
+async def test_real_sdk_span_is_traced_flushed_and_polled(
+    real_braintrust_sdk: Any, fake_braintrust_api: FakeBraintrust
+) -> None:
+    """Open, flush, and resolve the project through the real SDK."""
+    init_test_logger(fake_braintrust_api.project_id)
+    adapter = BraintrustAdapter()
+    fake_braintrust_api.rows_builders = [build_complete_rows, build_complete_rows]
+
+    with adapter.open_trace() as root_span_id:
+        pass
+    await adapter.wait_until_complete(root_span_id)
+
+    logged = real_braintrust_sdk.pop()
+    assert [row["root_span_id"] for row in logged] == [root_span_id]
+    assert logged[0]["span_attributes"]["name"] == "kitaru-run"
+    assert fake_braintrust_api.requested == [root_span_id, root_span_id]
 
 
 async def test_wait_polls_until_the_root_span_has_ended(

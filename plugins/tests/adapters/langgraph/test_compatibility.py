@@ -13,6 +13,7 @@ from langgraph.func import entrypoint
 from langgraph.graph import END, START, StateGraph
 
 from kitaru.api_models.v1.replay_config import ReplayOverride
+from kitaru.api_models.v1.session_node import NodeType
 from kitaru_langgraph import (
     CapabilityOperation,
     CapabilityTargetKind,
@@ -329,6 +330,63 @@ def test_real_langchain_factory_is_supported() -> None:
     main = langchain_runner.capabilities.get_target("main")
     assert main is not None
     assert main.supports(CapabilityOperation.OVERRIDE_MODEL)
+
+
+def test_real_deep_agent_factory_runs_through_runner(fake_client: Any) -> None:
+    from deepagents import create_deep_agent
+    from langchain.agents import create_agent
+    from langchain_core.language_models.fake_chat_models import (
+        FakeMessagesListChatModel,
+    )
+    from langchain_core.messages import AIMessage
+    from langchain_core.tools import tool
+
+    from kitaru_langgraph import KitaruGraphRunner
+
+    class ToolCallingFakeModel(FakeMessagesListChatModel):
+        # The stock fake rejects bind_tools, which every agent factory calls.
+        def bind_tools(self, tools: Any, **kwargs: Any) -> Any:
+            return self
+
+    @tool
+    def add(a: int, b: int) -> int:
+        """Add two integers."""
+        return a + b
+
+    add_call = {"name": "add", "args": {"a": 17, "b": 25}, "id": "call-1"}
+    model = ToolCallingFakeModel(
+        responses=[AIMessage(content="", tool_calls=[add_call]), AIMessage("42")]
+    )
+    agent_kwargs = {"model": model, "tools": [add]}
+    runner = KitaruGraphRunner.from_agent_factory(
+        create_deep_agent,
+        factory_kwargs=agent_kwargs,
+        local_subagents=(
+            LocalSubagentFactorySpec(
+                name="adder",
+                description="Adds numbers.",
+                factory=create_agent,
+                factory_kwargs=agent_kwargs,
+            ),
+        ),
+    )
+
+    assert runner.capabilities.get_target("adder") is not None
+    result = runner.invoke({"messages": [{"role": "user", "content": "17 + 25?"}]})
+
+    assert result["messages"][-1].content == "42"
+    batches = fake_client.instances[0].sessions.node_batches
+    recorded = [
+        (node.node_type, node.name)
+        for _, batch in batches
+        for node in batch.nodes
+        if node.node_type != NodeType.SPAN
+    ]
+    assert recorded == [
+        (NodeType.LLM_CALL, "ToolCallingFakeModel"),
+        (NodeType.TOOL_CALL, "add"),
+        (NodeType.LLM_CALL, "ToolCallingFakeModel"),
+    ]
 
 
 async def test_concurrent_async_calls_are_isolated(fake_client: Any) -> None:
