@@ -11,11 +11,13 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 #  or implied. See the License for the specific language governing
 #  permissions and limitations under the License.
-"""Manage the user-scoped local Kitaru Docker Compose deployment."""
+"""Manage the user-scoped local Kitaru Compose deployment."""
 
 import asyncio
 import contextlib
 import importlib.resources
+import ipaddress
+import json
 import os
 import re
 import secrets
@@ -49,10 +51,13 @@ LOCAL_PROJECT_NAME = "kitaru-local"
 LOCAL_IMAGE_ENV = "KITARU_LOCAL_IMAGE"
 POSTGRES_IMAGE = "postgres:16-alpine"
 _IMAGE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/@:+-]*$")
+_ANSI_ESCAPE_PATTERN = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 _INSTALL_HINT = (
-    "Install Docker from https://docs.docker.com/get-docker/, or use "
-    "Kitaru Cloud at https://cloud.zenml.io/."
+    "Install Docker from https://docs.docker.com/get-docker/ or Podman from "
+    "https://podman.io/docs/installation, or use Kitaru Cloud at "
+    "https://cloud.zenml.io/."
 )
+ContainerRuntime = Literal["docker", "podman"]
 
 
 class LocalRuntimeState(BaseModel):
@@ -64,6 +69,7 @@ class LocalRuntimeState(BaseModel):
     project: Literal["kitaru-local"] = "kitaru-local"
     server_image: str
     port: int = Field(default=DEFAULT_LOCAL_PORT, ge=1, le=65535)
+    runtime: ContainerRuntime = "docker"
 
     @property
     def server_url(self) -> str:
@@ -91,29 +97,37 @@ class ProcessResult:
     stderr: str
 
 
-class DockerCommandRunner(Protocol):
-    """Structural interface for Docker command execution."""
+class ContainerCommandRunner(Protocol):
+    """Structural interface for container runtime command execution."""
+
+    runtime: ContainerRuntime
 
     async def run(self, *arguments: str, timeout: float = 120) -> ProcessResult:
-        """Run one Docker command."""
+        """Run one container runtime command."""
 
     def stream(
         self,
         *arguments: str,
-        failure_message: str = "Docker command failed.",
+        failure_message: str = "Container runtime command failed.",
     ) -> AsyncIterator[str]:
-        """Stream output from one Docker command."""
+        """Stream output from one container runtime command."""
 
 
-class DockerRunner:
-    """Execute Docker without introducing a Docker SDK dependency."""
+class ContainerRunner:
+    """Execute a container runtime without introducing an SDK dependency."""
 
-    def __init__(self, executable: str) -> None:
-        """Initialize the runner with the resolved Docker executable."""
+    def __init__(self, executable: str, runtime: ContainerRuntime) -> None:
+        """Initialize the runner with the resolved runtime executable."""
         self.executable = executable
+        self.runtime = runtime
+
+    @property
+    def display_name(self) -> str:
+        """Return the runtime name for user-facing messages."""
+        return self.runtime.title()
 
     async def run(self, *arguments: str, timeout: float = 120) -> ProcessResult:
-        """Run one bounded Docker command and capture its output."""
+        """Run one bounded container runtime command and capture its output."""
         try:
             process = await asyncio.create_subprocess_exec(
                 self.executable,
@@ -124,7 +138,7 @@ class DockerRunner:
         except OSError as error:
             raise CLIError(
                 "invalid_configuration",
-                f"Docker could not be executed: {error}",
+                f"{self.display_name} could not be executed: {error}",
                 hint=_INSTALL_HINT,
             ) from error
         try:
@@ -133,7 +147,8 @@ class DockerRunner:
             process.kill()
             await process.communicate()
             raise CLIError(
-                "timeout", "Docker did not finish before the timeout expired."
+                "timeout",
+                f"{self.display_name} did not finish before the timeout expired.",
             ) from error
         except BaseException:
             await _terminate_process(process)
@@ -147,9 +162,9 @@ class DockerRunner:
     async def stream(
         self,
         *arguments: str,
-        failure_message: str = "Docker command failed.",
+        failure_message: str = "Container runtime command failed.",
     ) -> AsyncIterator[str]:
-        """Yield merged output lines from a running Docker command."""
+        """Yield merged output lines from a running container runtime command."""
         try:
             process = await asyncio.create_subprocess_exec(
                 self.executable,
@@ -160,7 +175,7 @@ class DockerRunner:
         except OSError as error:
             raise CLIError(
                 "invalid_configuration",
-                f"Docker could not be executed: {error}",
+                f"{self.display_name} could not be executed: {error}",
                 hint=_INSTALL_HINT,
             ) from error
         assert process.stdout is not None
@@ -193,16 +208,24 @@ async def start_local_runtime(
     timeout: float,
     port: int | None = None,
     progress: Callable[[str], None] | None = None,
-    runner: DockerCommandRunner | None = None,
+    runner: ContainerCommandRunner | None = None,
     paths: LocalRuntimePaths | None = None,
 ) -> tuple[dict[str, object], list[str]]:
     """Create or reuse the local deployment and wait for its server."""
     paths = paths or get_local_runtime_paths()
-    runner = runner or await _get_docker_runner()
     image, overridden = _get_server_image(package_version)
     with _operation_lock(paths):
-        await _validate_docker(runner)
         state = _read_state(paths.state)
+        if runner is None:
+            if state is None:
+                available_runners = await _get_available_container_runners()
+                runner = available_runners[0]
+            else:
+                runner = await _get_container_runner(state.runtime)
+                available_runners = [runner]
+        else:
+            await _validate_container_runtime(runner)
+            available_runners = [runner]
         resolved_port = _resolve_local_port(port, state)
         server_url = _get_local_server_url(resolved_port)
         port_changed = state is not None and state.port != resolved_port
@@ -213,7 +236,8 @@ async def start_local_runtime(
                 hint="Run `kitaru login --local` first.",
             )
         if state is None:
-            await _reject_unowned_resources(runner)
+            for available_runner in available_runners:
+                await _reject_unowned_resources(available_runner)
         elif state.server_image != image and not upgrade:
             raise CLIError(
                 "conflict",
@@ -229,10 +253,12 @@ async def start_local_runtime(
         if state is None or port_changed:
             await asyncio.to_thread(_reject_occupied_port, resolved_port)
         if state is None:
-            _write_runtime_files(paths, image=image, port=resolved_port)
+            _write_runtime_files(
+                paths, image=image, port=resolved_port, runtime=runner.runtime
+            )
             running = False
         else:
-            running = await _is_running(runner, paths)
+            running = await _is_running(runner)
         previous_environment = (
             paths.environment.read_text(encoding="utf-8")
             if state is not None and (state.server_image != image or port_changed)
@@ -277,7 +303,12 @@ async def start_local_runtime(
             )
             try:
                 if state is not None and (state.server_image != image or port_changed):
-                    _write_runtime_files(paths, image=image, port=resolved_port)
+                    _write_runtime_files(
+                        paths,
+                        image=image,
+                        port=resolved_port,
+                        runtime=runner.runtime,
+                    )
                 if progress is None:
                     await _run_compose(
                         runner,
@@ -287,18 +318,21 @@ async def start_local_runtime(
                     )
                 else:
                     base_arguments = _compose_arguments(paths)
-                    await _stream_docker_command(
-                        runner,
-                        (
+                    stream_arguments = (*base_arguments, *compose_arguments)
+                    if runner.runtime == "docker":
+                        stream_arguments = (
                             base_arguments[0],
                             "--progress",
                             "plain",
                             *base_arguments[1:],
                             *compose_arguments,
-                        ),
+                        )
+                    await _stream_container_command(
+                        runner,
+                        stream_arguments,
                         progress=progress,
                         timeout=max(timeout, 120),
-                        failure_message="Docker Compose up failed.",
+                        failure_message="Compose up failed.",
                     )
                 await _wait_for_health(server_url, max(timeout, 120))
             except BaseException:
@@ -339,7 +373,7 @@ async def start_local_runtime(
 async def stop_local_runtime(
     *,
     delete_volumes: bool,
-    runner: DockerCommandRunner | None = None,
+    runner: ContainerCommandRunner | None = None,
     paths: LocalRuntimePaths | None = None,
 ) -> dict[str, object]:
     """Stop a CLI-owned deployment and optionally delete its data."""
@@ -350,11 +384,18 @@ async def stop_local_runtime(
             "invalid_configuration",
             "No CLI-owned local Kitaru deployment was found.",
         )
-    runner = runner or await _get_docker_runner()
     if state is None:
+        if runner is None:
+            runners = await _get_available_container_runners()
+        else:
+            await _validate_container_runtime(runner)
+            runners = [runner]
         with _operation_lock(paths):
-            await _validate_docker(runner)
-            removed = await _remove_labeled_resources(runner)
+            removed = False
+            for available_runner in runners:
+                removed = (
+                    bool(await _remove_labeled_resources(available_runner)) or removed
+                )
             if not removed:
                 raise CLIError(
                     "invalid_configuration",
@@ -368,7 +409,10 @@ async def stop_local_runtime(
                 "data_deleted": True,
             }
     with _operation_lock(paths):
-        await _validate_docker(runner)
+        if runner is None:
+            runner = await _get_container_runner(state.runtime)
+        else:
+            await _validate_container_runtime(runner)
         arguments = ["down"]
         if delete_volumes:
             arguments.append("--volumes")
@@ -411,7 +455,7 @@ async def get_local_logs(
     service: str | None,
     tail: int,
     follow: bool,
-    runner: DockerCommandRunner | None = None,
+    runner: ContainerCommandRunner | None = None,
     paths: LocalRuntimePaths | None = None,
 ) -> list[str] | AsyncIterator[str]:
     """Return or stream logs from the CLI-owned local deployment."""
@@ -422,52 +466,154 @@ async def get_local_logs(
             "invalid_arguments", "--service must be either 'server' or 'db'."
         )
     paths = paths or get_local_runtime_paths()
-    if _read_state(paths.state) is None:
+    state = _read_state(paths.state)
+    if state is None:
         raise CLIError(
             "invalid_configuration",
             "No CLI-owned local Kitaru deployment was found.",
         )
-    runner = runner or await _get_docker_runner()
-    await _validate_docker(runner)
+    if runner is None:
+        runner = await _get_container_runner(state.runtime)
+    else:
+        await _validate_container_runtime(runner)
     arguments = [*_compose_arguments(paths), "logs", "--tail", str(tail)]
     if follow:
         arguments.append("--follow")
     if service:
         arguments.append(service)
     if follow:
-        return runner.stream(*arguments, failure_message="Docker Compose logs failed.")
+        return _strip_ansi_stream(
+            runner.stream(*arguments, failure_message="Compose logs failed.")
+        )
     result = await runner.run(*arguments, timeout=60)
-    _raise_for_docker(result, "Docker Compose logs failed.")
-    return result.stdout.splitlines()
+    _raise_for_runtime(result, "Compose logs failed.")
+    return _strip_ansi(result.stdout).splitlines()
 
 
-async def _get_docker_runner() -> DockerRunner:
-    executable = shutil.which("docker")
-    if executable is None:
+async def _get_container_runner(
+    required_runtime: ContainerRuntime | None = None,
+) -> ContainerRunner:
+    runtimes: tuple[ContainerRuntime, ...] = (
+        (required_runtime,) if required_runtime is not None else ("docker", "podman")
+    )
+    validation_error: CLIError | None = None
+    for runtime in runtimes:
+        if executable := shutil.which(runtime):
+            runner = ContainerRunner(executable, runtime)
+            try:
+                await _validate_container_runtime(runner)
+            except CLIError as error:
+                if required_runtime is not None:
+                    raise
+                validation_error = error
+                continue
+            return runner
+    if validation_error is not None:
+        raise validation_error
+    if required_runtime is not None:
         raise CLIError(
             "invalid_configuration",
-            "Docker with Compose v2 is required to run Kitaru locally.",
+            f"This local Kitaru deployment uses {required_runtime.title()}, but "
+            f"the {required_runtime!r} executable was not found.",
             hint=_INSTALL_HINT,
         )
-    return DockerRunner(executable)
+    raise CLIError(
+        "invalid_configuration",
+        "Docker or Podman with Compose support is required to run Kitaru locally.",
+        hint=_INSTALL_HINT,
+    )
 
 
-async def _validate_docker(runner: DockerCommandRunner) -> None:
+async def _get_available_container_runners() -> list[ContainerRunner]:
+    """Return every installed and healthy local container runtime."""
+    runners: list[ContainerRunner] = []
+    validation_error: CLIError | None = None
+    runtimes: tuple[ContainerRuntime, ...] = ("docker", "podman")
+    for runtime in runtimes:
+        if executable := shutil.which(runtime):
+            runner = ContainerRunner(executable, runtime)
+            try:
+                await _validate_container_runtime(runner)
+            except CLIError as error:
+                validation_error = error
+                continue
+            runners.append(runner)
+    if runners:
+        return runners
+    if validation_error is not None:
+        raise validation_error
+    raise CLIError(
+        "invalid_configuration",
+        "Docker or Podman with Compose support is required to run Kitaru locally.",
+        hint=_INSTALL_HINT,
+    )
+
+
+async def _validate_container_runtime(runner: ContainerCommandRunner) -> None:
     compose = await runner.run("compose", "version", timeout=15)
     if compose.returncode:
+        compose_name = (
+            "Docker Compose v2"
+            if runner.runtime == "docker"
+            else "Podman Compose support"
+        )
         raise CLIError(
             "invalid_configuration",
-            "Docker Compose v2 is required to run Kitaru locally.",
+            f"{compose_name} is required to run Kitaru locally.",
             hint=_INSTALL_HINT,
         )
     info = await runner.run("info", timeout=15)
     if info.returncode:
+        hint = (
+            "Start Docker, then retry the command."
+            if runner.runtime == "docker"
+            else "Start a Podman machine, then retry the command."
+        )
         raise CLIError(
             "invalid_configuration",
-            "The Docker daemon is unavailable.",
-            hint="Start Docker, then retry the command.",
-            details=_docker_details(info),
+            f"The {runner.runtime.title()} service is unavailable.",
+            hint=hint,
+            details=_runtime_details(info),
         )
+    if runner.runtime == "podman":
+        connection_name = os.environ.get("CONTAINER_CONNECTION")
+        connection_uri = (
+            None if connection_name is not None else os.environ.get("CONTAINER_HOST")
+        )
+        if connection_name is not None or connection_uri is None:
+            connections = await runner.run(
+                "system", "connection", "list", "--format", "json", timeout=15
+            )
+            if connections.returncode:
+                raise CLIError(
+                    "invalid_configuration",
+                    "The active Podman connection could not be inspected.",
+                    details=_runtime_details(connections),
+                )
+            try:
+                configured_connections = json.loads(connections.stdout or "[]")
+                connection_uri = next(
+                    (
+                        connection["URI"]
+                        for connection in configured_connections
+                        if connection.get("Name") == connection_name
+                        or (connection_name is None and connection.get("Default"))
+                    ),
+                    None,
+                )
+            except (AttributeError, KeyError, TypeError, json.JSONDecodeError) as error:
+                raise CLIError(
+                    "invalid_configuration",
+                    "The active Podman connection could not be inspected.",
+                    details=_runtime_details(connections),
+                ) from error
+        if connection_uri is not None and not _is_local_container_host(connection_uri):
+            raise CLIError(
+                "invalid_configuration",
+                "The active Podman connection points to a remote daemon.",
+                hint="Select a local Podman connection, then retry the command.",
+            )
+        return
     context = await runner.run(
         "context", "inspect", "--format", "{{json .Endpoints.docker.Host}}", timeout=15
     )
@@ -475,7 +621,7 @@ async def _validate_docker(runner: DockerCommandRunner) -> None:
         raise CLIError(
             "invalid_configuration",
             "The active Docker context could not be inspected.",
-            details=_docker_details(context),
+            details=_runtime_details(context),
         )
     host = context.stdout.strip().strip('"')
     if host.startswith(("ssh://", "tcp://", "http://", "https://")):
@@ -484,6 +630,19 @@ async def _validate_docker(runner: DockerCommandRunner) -> None:
             "The active Docker context points to a remote daemon.",
             hint="Select a local Docker context, then retry the command.",
         )
+
+
+def _is_local_container_host(host: str) -> bool:
+    """Check whether a container service URI is reachable on this host."""
+    parsed = urlsplit(host)
+    if parsed.scheme == "unix":
+        return True
+    if parsed.hostname == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(parsed.hostname or "").is_loopback
+    except ValueError:
+        return False
 
 
 def _get_local_server_url(port: int) -> str:
@@ -547,7 +706,7 @@ def _get_server_image(package_version: str) -> tuple[str, bool]:
 
 
 async def _ensure_image(
-    runner: DockerCommandRunner,
+    runner: ContainerCommandRunner,
     image: str,
     *,
     pull_if_missing: bool,
@@ -569,27 +728,27 @@ async def _ensure_image(
         arguments.extend(("--platform", platform))
     arguments.append(image)
     if progress is not None:
-        await _stream_docker_command(
+        await _stream_container_command(
             runner,
             tuple(arguments),
             progress=progress,
             timeout=600,
-            failure_message=f"Docker could not pull {image!r}.",
+            failure_message=f"{runner.runtime.title()} could not pull {image!r}.",
         )
         return
     pulled = await runner.run(*arguments, timeout=600)
-    _raise_for_docker(pulled, f"Docker could not pull {image!r}.")
+    _raise_for_runtime(pulled, f"{runner.runtime.title()} could not pull {image!r}.")
 
 
-async def _stream_docker_command(
-    runner: DockerCommandRunner,
+async def _stream_container_command(
+    runner: ContainerCommandRunner,
     arguments: tuple[str, ...],
     *,
     progress: Callable[[str], None],
     timeout: float,
     failure_message: str,
 ) -> None:
-    """Forward one bounded Docker command's output as it arrives."""
+    """Forward one bounded container runtime command's output as it arrives."""
     try:
         async with asyncio.timeout(timeout):
             async for line in runner.stream(
@@ -598,7 +757,8 @@ async def _stream_docker_command(
                 progress(line)
     except TimeoutError as error:
         raise CLIError(
-            "timeout", "Docker did not finish before the timeout expired."
+            "timeout",
+            f"{runner.runtime.title()} did not finish before the timeout expired.",
         ) from error
 
 
@@ -610,7 +770,7 @@ _RESOURCE_QUERIES: tuple[tuple[str, tuple[str, ...]], ...] = (
 
 
 async def _find_labeled_resources(
-    runner: DockerCommandRunner,
+    runner: ContainerCommandRunner,
 ) -> dict[str, list[str]]:
     found: dict[str, list[str]] = {}
     for kind, prefix in _RESOURCE_QUERIES:
@@ -619,14 +779,16 @@ async def _find_labeled_resources(
             f"label=com.docker.compose.project={LOCAL_PROJECT_NAME}",
             timeout=30,
         )
-        _raise_for_docker(result, "Docker resources could not be inspected.")
+        _raise_for_runtime(
+            result, "Container runtime resources could not be inspected."
+        )
         identifiers = result.stdout.split()
         if identifiers:
             found[kind] = identifiers
     return found
 
 
-async def _reject_unowned_resources(runner: DockerCommandRunner) -> None:
+async def _reject_unowned_resources(runner: ContainerCommandRunner) -> None:
     found = await _find_labeled_resources(runner)
     if not found:
         return
@@ -635,13 +797,16 @@ async def _reject_unowned_resources(runner: DockerCommandRunner) -> None:
     # an adopted volume would leave the server unable to authenticate.
     raise CLIError(
         "conflict",
-        "Docker resources named for Kitaru exist without CLI ownership state.",
+        "Container runtime resources named for Kitaru exist without CLI ownership "
+        "state.",
         hint="Run `kitaru logout --volumes` to delete them, then retry.",
         details={kind: sorted(values) for kind, values in found.items()},
     )
 
 
-async def _remove_labeled_resources(runner: DockerCommandRunner) -> dict[str, object]:
+async def _remove_labeled_resources(
+    runner: ContainerCommandRunner,
+) -> dict[str, object]:
     found = await _find_labeled_resources(runner)
     removals = (
         ("containers", ("rm", "--force")),
@@ -653,7 +818,9 @@ async def _remove_labeled_resources(runner: DockerCommandRunner) -> dict[str, ob
         if not identifiers:
             continue
         result = await runner.run(*command, *identifiers, timeout=120)
-        _raise_for_docker(result, f"Docker {kind} could not be removed.")
+        _raise_for_runtime(
+            result, f"{runner.runtime.title()} {kind} could not be removed."
+        )
     return {kind: sorted(values) for kind, values in found.items()}
 
 
@@ -670,10 +837,17 @@ def _reject_occupied_port(port: int) -> None:
     )
 
 
-async def _is_running(runner: DockerCommandRunner, paths: LocalRuntimePaths) -> bool:
-    result = await _run_compose(
-        runner, paths, "ps", "--status", "running", "--quiet", timeout=30
+async def _is_running(runner: ContainerCommandRunner) -> bool:
+    result = await runner.run(
+        "ps",
+        "--quiet",
+        "--filter",
+        f"label=com.docker.compose.project={LOCAL_PROJECT_NAME}",
+        "--filter",
+        "status=running",
+        timeout=30,
     )
+    _raise_for_runtime(result, "Container runtime state could not be inspected.")
     return len(result.stdout.splitlines()) >= 2
 
 
@@ -697,13 +871,13 @@ async def _wait_for_health(server_url: str, timeout: float) -> None:
 
 
 async def _run_compose(
-    runner: DockerCommandRunner,
+    runner: ContainerCommandRunner,
     paths: LocalRuntimePaths,
     *arguments: str,
     timeout: float,
 ) -> ProcessResult:
     result = await runner.run(*_compose_arguments(paths), *arguments, timeout=timeout)
-    _raise_for_docker(result, f"Docker Compose {' '.join(arguments)} failed.")
+    _raise_for_runtime(result, f"Compose {' '.join(arguments)} failed.")
     return result
 
 
@@ -724,6 +898,7 @@ def _write_runtime_files(
     *,
     image: str,
     port: int,
+    runtime: ContainerRuntime = "docker",
 ) -> None:
     paths.directory.mkdir(parents=True, exist_ok=True, mode=DIRECTORY_MODE)
     os.chmod(paths.directory, DIRECTORY_MODE)
@@ -764,7 +939,7 @@ def _write_runtime_files(
         _write_private_text(paths.environment, "\n".join(replaced) + "\n")
     write_json_file(
         paths.state,
-        LocalRuntimeState(server_image=image, port=port).model_dump(),
+        LocalRuntimeState(server_image=image, port=port, runtime=runtime).model_dump(),
     )
 
 
@@ -791,7 +966,10 @@ def _read_state(path: Path) -> LocalRuntimeState | None:
         raise CLIError(
             "invalid_configuration",
             "The local Kitaru deployment state is invalid.",
-            hint="Remove the local runtime state after verifying Docker resources.",
+            hint=(
+                "Remove the local runtime state after verifying container runtime "
+                "resources."
+            ),
         ) from error
 
 
@@ -839,20 +1017,31 @@ def _remove_stale_lock(path: Path) -> bool:
     return False
 
 
-def _raise_for_docker(result: ProcessResult, message: str) -> None:
+def _raise_for_runtime(result: ProcessResult, message: str) -> None:
     if result.returncode:
         raise CLIError(
-            "internal_error", message, details=_docker_details(result), retryable=True
+            "internal_error", message, details=_runtime_details(result), retryable=True
         )
 
 
-def _docker_details(result: ProcessResult) -> dict[str, str]:
+def _runtime_details(result: ProcessResult) -> dict[str, str]:
     detail = (result.stderr or result.stdout).strip()
     return {"docker_output": detail[-4000:]}
 
 
 def _decode_output(value: bytes) -> str:
     return value.decode("utf-8", errors="replace").strip()
+
+
+def _strip_ansi(value: str) -> str:
+    """Remove terminal escape sequences from captured output."""
+    return _ANSI_ESCAPE_PATTERN.sub("", value)
+
+
+async def _strip_ansi_stream(lines: AsyncIterator[str]) -> AsyncIterator[str]:
+    """Remove terminal escape sequences from streamed output."""
+    async for line in lines:
+        yield _strip_ansi(line)
 
 
 async def _terminate_process(process: asyncio.subprocess.Process) -> None:

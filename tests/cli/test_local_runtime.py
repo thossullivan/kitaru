@@ -30,10 +30,12 @@ from kitaru.cli.output import CLIError
 class FakeDockerRunner:
     """Record Docker commands and return configurable results."""
 
-    def __init__(self) -> None:
-        """Initialize a successful local Docker daemon."""
+    def __init__(self, runtime: local_runtime.ContainerRuntime = "docker") -> None:
+        """Initialize a successful local container runtime."""
+        self.runtime = runtime
         self.calls: list[tuple[str, ...]] = []
         self.stream_calls: list[tuple[str, ...]] = []
+        self.stream_lines = ("server ready", "db ready")
         self.results: dict[tuple[str, ...], ProcessResult] = {}
 
     async def run(self, *arguments: str, timeout: float = 120) -> ProcessResult:
@@ -56,7 +58,7 @@ class FakeDockerRunner:
         del failure_message
         self.calls.append(arguments)
         self.stream_calls.append(arguments)
-        for line in ("server ready", "db ready"):
+        for line in self.stream_lines:
             yield line
 
 
@@ -75,8 +77,10 @@ def runtime_paths(tmp_path: Path) -> LocalRuntimePaths:
 
 @pytest.fixture(autouse=True)
 def clear_local_port_environment(monkeypatch) -> None:
-    """Keep local-port tests independent of the developer environment."""
+    """Keep local-runtime tests independent of the developer environment."""
     monkeypatch.delenv(local_runtime.LOCAL_PORT_ENV, raising=False)
+    monkeypatch.delenv("CONTAINER_CONNECTION", raising=False)
+    monkeypatch.delenv("CONTAINER_HOST", raising=False)
 
 
 async def test_first_start_writes_private_state_and_starts_compose(
@@ -185,6 +189,7 @@ def test_legacy_runtime_state_defaults_to_port_8000(runtime_paths) -> None:
 
     assert state is not None
     assert state.port == 8000
+    assert state.runtime == "docker"
     assert state.server_url == "http://localhost:8000"
 
 
@@ -231,10 +236,16 @@ async def test_changed_port_reconfigures_running_deployment(
     image = "zenmldocker/kitaru-server:0.21.0"
     local_runtime._write_runtime_files(runtime_paths, image=image, port=8000)
     runner = FakeDockerRunner()
-    compose = local_runtime._compose_arguments(runtime_paths)
-    runner.results[(*compose, "ps", "--status", "running", "--quiet")] = ProcessResult(
-        0, "server\ndb\n", ""
-    )
+    runner.results[
+        (
+            "ps",
+            "--quiet",
+            "--filter",
+            "label=com.docker.compose.project=kitaru-local",
+            "--filter",
+            "status=running",
+        )
+    ] = ProcessResult(0, "server\ndb\n", "")
     checked_ports: list[int] = []
     monkeypatch.setattr(local_runtime, "_reject_occupied_port", checked_ports.append)
 
@@ -268,10 +279,16 @@ async def test_failed_port_reconfiguration_restores_running_deployment(
     previous_environment = runtime_paths.environment.read_text()
     previous_state = runtime_paths.state.read_text()
     runner = FakeDockerRunner()
-    compose = local_runtime._compose_arguments(runtime_paths)
-    runner.results[(*compose, "ps", "--status", "running", "--quiet")] = ProcessResult(
-        0, "server\ndb\n", ""
-    )
+    runner.results[
+        (
+            "ps",
+            "--quiet",
+            "--filter",
+            "label=com.docker.compose.project=kitaru-local",
+            "--filter",
+            "status=running",
+        )
+    ] = ProcessResult(0, "server\ndb\n", "")
     monkeypatch.setattr(local_runtime, "_reject_occupied_port", lambda _: None)
 
     async def health(server_url: str, timeout: float) -> None:
@@ -321,10 +338,16 @@ async def test_failed_runtime_file_update_restores_previous_files(
     previous_environment = runtime_paths.environment.read_text()
     previous_state = runtime_paths.state.read_text()
     runner = FakeDockerRunner()
-    compose = local_runtime._compose_arguments(runtime_paths)
-    runner.results[(*compose, "ps", "--status", "running", "--quiet")] = ProcessResult(
-        0, "server\ndb\n", ""
-    )
+    runner.results[
+        (
+            "ps",
+            "--quiet",
+            "--filter",
+            "label=com.docker.compose.project=kitaru-local",
+            "--filter",
+            "status=running",
+        )
+    ] = ProcessResult(0, "server\ndb\n", "")
     monkeypatch.setattr(local_runtime, "_reject_occupied_port", lambda _: None)
     original_write = local_runtime.write_json_file
     failed = False
@@ -381,27 +404,166 @@ async def test_interactive_start_streams_pull_and_compose_progress(
     assert compose_call[:3] == ("compose", "--progress", "plain")
 
 
+async def test_podman_interactive_start_omits_docker_progress_option(
+    runtime_paths, monkeypatch
+) -> None:
+    """Podman Compose starts without Docker's global progress option."""
+    runner = FakeDockerRunner(runtime="podman")
+    monkeypatch.setattr(local_runtime, "_reject_occupied_port", lambda _: None)
+
+    async def healthy(server_url: str, timeout: float) -> None:
+        del server_url, timeout
+
+    monkeypatch.setattr(local_runtime, "_wait_for_health", healthy)
+    await local_runtime.start_local_runtime(
+        package_version="0.21.0",
+        upgrade=False,
+        timeout=30,
+        progress=lambda _: None,
+        runner=runner,
+        paths=runtime_paths,
+    )
+
+    compose_call = next(call for call in runner.stream_calls if "up" in call)
+    assert compose_call[:2] == ("compose", "--project-name")
+    assert "--progress" not in compose_call
+    assert json.loads(runtime_paths.state.read_text())["runtime"] == "podman"
+
+
 async def test_missing_compose_has_install_and_cloud_hint() -> None:
     """A Docker installation without Compose v2 fails with both alternatives."""
     runner = FakeDockerRunner()
     runner.results[("compose", "version")] = ProcessResult(1, "", "missing")
 
     with pytest.raises(CLIError, match="Compose v2") as raised:
-        await local_runtime._validate_docker(runner)
+        await local_runtime._validate_container_runtime(runner)
 
     assert "docs.docker.com" in str(raised.value.hint)
     assert "cloud.zenml.io" in str(raised.value.hint)
 
 
-async def test_missing_docker_has_install_and_cloud_hint(monkeypatch) -> None:
-    """An absent Docker CLI produces an actionable local-or-Cloud choice."""
+async def test_missing_container_runtime_has_install_and_cloud_hint(
+    monkeypatch,
+) -> None:
+    """Absent container CLIs produce an actionable local-or-Cloud choice."""
     monkeypatch.setattr(local_runtime.shutil, "which", lambda executable: None)
 
-    with pytest.raises(CLIError, match="Docker with Compose v2") as raised:
-        await local_runtime._get_docker_runner()
+    with pytest.raises(CLIError, match="Docker or Podman") as raised:
+        await local_runtime._get_container_runner()
 
     assert "docs.docker.com" in str(raised.value.hint)
+    assert "podman.io" in str(raised.value.hint)
     assert "cloud.zenml.io" in str(raised.value.hint)
+
+
+@pytest.mark.parametrize(
+    ("available", "expected"),
+    [
+        ({"docker": "/usr/bin/docker", "podman": "/usr/bin/podman"}, "docker"),
+        ({"podman": "/usr/bin/podman"}, "podman"),
+    ],
+)
+async def test_container_runtime_resolution_prefers_docker_then_podman(
+    monkeypatch, available: dict[str, str], expected: str
+) -> None:
+    """Runtime discovery remains deterministic when both CLIs are installed."""
+    monkeypatch.setattr(local_runtime.shutil, "which", available.get)
+
+    async def valid(runner) -> None:
+        del runner
+
+    monkeypatch.setattr(local_runtime, "_validate_container_runtime", valid)
+
+    runner = await local_runtime._get_container_runner()
+
+    assert runner.runtime == expected
+
+
+async def test_required_runtime_does_not_switch_engines(monkeypatch) -> None:
+    """An owned deployment never silently moves to another engine's storage."""
+    monkeypatch.setattr(
+        local_runtime.shutil,
+        "which",
+        {"docker": "/usr/bin/docker", "podman": "/usr/bin/podman"}.get,
+    )
+
+    async def valid(runner) -> None:
+        del runner
+
+    monkeypatch.setattr(local_runtime, "_validate_container_runtime", valid)
+
+    runner = await local_runtime._get_container_runner("podman")
+
+    assert runner.runtime == "podman"
+
+
+async def test_new_deployment_falls_back_from_broken_docker_to_podman(
+    monkeypatch,
+) -> None:
+    """A stopped Docker installation does not block a healthy Podman machine."""
+    monkeypatch.setattr(
+        local_runtime.shutil,
+        "which",
+        {"docker": "/usr/bin/docker", "podman": "/usr/bin/podman"}.get,
+    )
+    validated: list[local_runtime.ContainerRuntime] = []
+
+    async def validate(runner) -> None:
+        validated.append(runner.runtime)
+        if runner.runtime == "docker":
+            raise CLIError("invalid_configuration", "Docker is unavailable.")
+
+    monkeypatch.setattr(local_runtime, "_validate_container_runtime", validate)
+
+    runner = await local_runtime._get_container_runner()
+
+    assert validated == ["docker", "podman"]
+    assert runner.runtime == "podman"
+
+
+async def test_existing_deployment_resolves_its_persisted_runtime(
+    runtime_paths, monkeypatch
+) -> None:
+    """Later logins keep using the engine that owns the deployment's data."""
+    local_runtime._write_runtime_files(
+        runtime_paths,
+        image="zenmldocker/kitaru-server:0.21.0",
+        port=8000,
+        runtime="podman",
+    )
+    runner = FakeDockerRunner(runtime="podman")
+    running_call = (
+        "ps",
+        "--quiet",
+        "--filter",
+        "label=com.docker.compose.project=kitaru-local",
+        "--filter",
+        "status=running",
+    )
+    runner.results[running_call] = ProcessResult(0, "server\ndb\n", "")
+    requested: list[local_runtime.ContainerRuntime | None] = []
+
+    async def resolve(
+        required_runtime: local_runtime.ContainerRuntime | None = None,
+    ) -> FakeDockerRunner:
+        requested.append(required_runtime)
+        return runner
+
+    async def healthy(server_url: str, timeout: float) -> None:
+        del server_url, timeout
+
+    monkeypatch.setattr(local_runtime, "_get_container_runner", resolve)
+    monkeypatch.setattr(local_runtime, "_wait_for_health", healthy)
+
+    item, _ = await local_runtime.start_local_runtime(
+        package_version="0.21.0",
+        upgrade=False,
+        timeout=30,
+        paths=runtime_paths,
+    )
+
+    assert requested == ["podman"]
+    assert item["deployment"] == "reused"
 
 
 async def test_remote_docker_context_is_rejected() -> None:
@@ -412,7 +574,86 @@ async def test_remote_docker_context_is_rejected() -> None:
     ] = ProcessResult(0, '"ssh://docker.example.com"', "")
 
     with pytest.raises(CLIError, match="remote daemon"):
-        await local_runtime._validate_docker(runner)
+        await local_runtime._validate_container_runtime(runner)
+
+
+async def test_podman_validation_skips_docker_context_inspection() -> None:
+    """A Podman machine's loopback SSH connection remains valid."""
+    runner = FakeDockerRunner(runtime="podman")
+    runner.results[("system", "connection", "list", "--format", "json")] = (
+        ProcessResult(
+            0,
+            json.dumps(
+                [
+                    {
+                        "Name": "podman-machine-default",
+                        "URI": "ssh://core@127.0.0.1:53298/run/user/501/podman.sock",
+                        "Default": True,
+                    }
+                ]
+            ),
+            "",
+        )
+    )
+
+    await local_runtime._validate_container_runtime(runner)
+
+    assert runner.calls == [
+        ("compose", "version"),
+        ("info",),
+        ("system", "connection", "list", "--format", "json"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "ssh://root@podman.example.com/run/podman/podman.sock",
+        "tcp://192.0.2.10:1234",
+    ],
+)
+async def test_remote_podman_connection_is_rejected(uri: str) -> None:
+    """A remote Podman service cannot expose ports on the local host."""
+    runner = FakeDockerRunner(runtime="podman")
+    runner.results[("system", "connection", "list", "--format", "json")] = (
+        ProcessResult(
+            0,
+            json.dumps([{"Name": "remote", "URI": uri, "Default": True}]),
+            "",
+        )
+    )
+
+    with pytest.raises(CLIError, match="remote daemon"):
+        await local_runtime._validate_container_runtime(runner)
+
+
+async def test_podman_named_connection_takes_precedence_over_host(
+    monkeypatch,
+) -> None:
+    """A named Podman connection overrides the configured container host."""
+    runner = FakeDockerRunner(runtime="podman")
+    runner.results[("system", "connection", "list", "--format", "json")] = (
+        ProcessResult(
+            0,
+            json.dumps(
+                [
+                    {
+                        "Name": "remote",
+                        "URI": "ssh://root@podman.example.com/run/podman/podman.sock",
+                        "Default": False,
+                    }
+                ]
+            ),
+            "",
+        )
+    )
+    monkeypatch.setenv("CONTAINER_CONNECTION", "remote")
+    monkeypatch.setenv("CONTAINER_HOST", "unix:///run/user/501/podman.sock")
+
+    with pytest.raises(CLIError, match="remote daemon"):
+        await local_runtime._validate_container_runtime(runner)
+
+    assert ("system", "connection", "list", "--format", "json") in runner.calls
 
 
 async def test_developer_override_must_exist_locally(
@@ -547,7 +788,7 @@ async def test_logs_use_bounded_tail_and_service(runtime_paths) -> None:
     runner = FakeDockerRunner()
     compose = local_runtime._compose_arguments(runtime_paths)
     runner.results[(*compose, "logs", "--tail", "25", "server")] = ProcessResult(
-        0, "ready\nserving", ""
+        0, "\x1b[32mready\x1b[0m\nserving", ""
     )
 
     result = await local_runtime.get_local_logs(
@@ -559,6 +800,55 @@ async def test_logs_use_bounded_tail_and_service(runtime_paths) -> None:
     )
 
     assert result == ["ready", "serving"]
+
+
+async def test_followed_logs_strip_ansi_sequences(runtime_paths) -> None:
+    """Followed logs remove terminal formatting from every streamed line."""
+    local_runtime._write_runtime_files(
+        runtime_paths,
+        image="zenmldocker/kitaru-server:0.21.0",
+        port=8000,
+    )
+    runner = FakeDockerRunner(runtime="podman")
+    runner.stream_lines = ("\x1b[32mready\x1b[0m", "\x1b[1mserving\x1b[0m")
+
+    result = await local_runtime.get_local_logs(
+        service="server",
+        tail=25,
+        follow=True,
+        runner=runner,
+        paths=runtime_paths,
+    )
+
+    assert not isinstance(result, list)
+    assert [line async for line in result] == ["ready", "serving"]
+    assert runner.stream_calls == [
+        (
+            *local_runtime._compose_arguments(runtime_paths),
+            "logs",
+            "--tail",
+            "25",
+            "--follow",
+            "server",
+        )
+    ]
+
+
+async def test_running_state_uses_engine_filters() -> None:
+    """Running-state checks do not depend on a Compose provider's ps flags."""
+    runner = FakeDockerRunner(runtime="podman")
+    call = (
+        "ps",
+        "--quiet",
+        "--filter",
+        "label=com.docker.compose.project=kitaru-local",
+        "--filter",
+        "status=running",
+    )
+    runner.results[call] = ProcessResult(0, "server\ndb\n", "")
+
+    assert await local_runtime._is_running(runner)
+    assert runner.calls == [call]
 
 
 def test_stale_operation_lock_is_reclaimed(runtime_paths) -> None:
@@ -647,6 +937,39 @@ async def test_orphaned_resources_name_themselves_and_point_at_the_cleanup(
     assert raised.value.details == {"volumes": ["kitaru-local_postgres_data"]}
 
 
+async def test_first_start_checks_every_healthy_runtime(
+    runtime_paths, monkeypatch
+) -> None:
+    """A first start finds Podman resources when Docker is also healthy."""
+    docker = FakeDockerRunner()
+    podman = _orphan_volume_runner()
+    podman.runtime = "podman"
+    runners = {"docker": docker, "podman": podman}
+    monkeypatch.setattr(
+        local_runtime.shutil,
+        "which",
+        {"docker": "/usr/bin/docker", "podman": "/usr/bin/podman"}.get,
+    )
+    monkeypatch.setattr(
+        local_runtime,
+        "ContainerRunner",
+        lambda _executable, runtime: runners[runtime],
+    )
+
+    with pytest.raises(CLIError, match="without CLI ownership state") as raised:
+        await local_runtime.start_local_runtime(
+            package_version="0.21.0",
+            upgrade=False,
+            timeout=30,
+            paths=runtime_paths,
+        )
+
+    assert raised.value.details == {"volumes": ["kitaru-local_postgres_data"]}
+    label = f"label=com.docker.compose.project={local_runtime.LOCAL_PROJECT_NAME}"
+    assert ("volume", "ls", "--quiet", "--filter", label) in docker.calls
+    assert not runtime_paths.state.exists()
+
+
 async def test_deleting_volumes_removes_orphaned_resources(runtime_paths) -> None:
     """A stop with data deletion clears resources the state no longer tracks."""
     runner = _orphan_volume_runner()
@@ -658,6 +981,35 @@ async def test_deleting_volumes_removes_orphaned_resources(runtime_paths) -> Non
     assert item["deployment"] == "deleted"
     assert item["data_deleted"] is True
     assert ("volume", "rm", "kitaru-local_postgres_data") in runner.calls
+
+
+async def test_deleting_volumes_checks_every_healthy_runtime(
+    runtime_paths, monkeypatch
+) -> None:
+    """State-less cleanup finds Podman resources when Docker is also healthy."""
+    docker = FakeDockerRunner()
+    podman = _orphan_volume_runner()
+    podman.runtime = "podman"
+    runners = {"docker": docker, "podman": podman}
+    monkeypatch.setattr(
+        local_runtime.shutil,
+        "which",
+        {"docker": "/usr/bin/docker", "podman": "/usr/bin/podman"}.get,
+    )
+    monkeypatch.setattr(
+        local_runtime,
+        "ContainerRunner",
+        lambda _executable, runtime: runners[runtime],
+    )
+
+    item = await local_runtime.stop_local_runtime(
+        delete_volumes=True, paths=runtime_paths
+    )
+
+    assert item["deployment"] == "deleted"
+    assert ("volume", "rm", "kitaru-local_postgres_data") in podman.calls
+    label = f"label=com.docker.compose.project={local_runtime.LOCAL_PROJECT_NAME}"
+    assert ("volume", "ls", "--quiet", "--filter", label) in docker.calls
 
 
 async def test_stop_without_resources_reports_no_deployment(runtime_paths) -> None:
