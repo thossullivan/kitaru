@@ -1,0 +1,4 @@
+.env
+runs/*
+!runs/.gitkeep
+traces/generated-*.jsonl

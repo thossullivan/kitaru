@@ -1,0 +1,44 @@
+[project]
+name = "kitaru-extended-returns-demo"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "filelock>=3.20,<4",
+    "kitaru[cli,worker]>=0.27.0",
+    "kitaru-langfuse-importer>=0.4.0",
+    "kitaru-pydantic-ai>=0.3.0",
+    "langfuse>=4.14,<5",
+    "pydantic-ai-slim[openai,openrouter]>=2.22,<3",
+]
+
+[tool.uv]
+package = false
+exclude-newer = "3 days"
+
+[tool.uv.exclude-newer-package]
+kitaru = false
+kitaru-braintrust-importer = false
+kitaru-evaluator = false
+kitaru-jsonl-importer = false
+kitaru-langfuse-importer = false
+kitaru-langgraph = false
+kitaru-langsmith-importer = false
+kitaru-openai-agents = false
+kitaru-pydantic-ai = false
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.11",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]

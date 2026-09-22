@@ -13,6 +13,33 @@ schema:
     - not_applicable
   cost_classes: [none, low, medium, high]
 examples:
+  - id: pydantic-ai-returns-operations
+    path: examples/python/pydantic_ai_returns_operations
+    public_docs: [examples/README.md]
+    owner_area: Extended synthetic returns corpus for proactive Kaizen investigation and model comparison
+    coverage:
+      deterministic_pytest:
+        status: covered
+        test_file: examples/python/pydantic_ai_returns_operations/tests/test_domain.py
+        notes: Covers the reviewed corpus, deterministic commerce state, evaluator contract, and resumable generation helpers without provider calls.
+      local_smoke:
+        status: help_only
+        command: uv run --project examples/python/pydantic_ai_returns_operations pytest -q
+        requires_server: false
+        timeout_seconds: 60
+      live_provider:
+        status: manual_only
+        provider: openai
+        required_env: [OPENAI_API_KEY]
+        timeout_seconds: 1800
+        cost_class: medium
+        command: cd examples/python/pydantic_ai_returns_operations && ./generate.sh --trace-backend none --model openai:gpt-5-nano --batch-id manual-pilot --manifest runs/manual-pilot.jsonl --case-limit 6 --fresh
+        waiver:
+          reason: The live corpus calls a paid model; Langfuse export also needs project credentials.
+          reviewer_action: Run a six-case pilot before generating the full 36-episode evidence set.
+    release_policy:
+      required_when_changed: false
+      waiver_allowed: true
   - id: pydantic-ai-ticket-resolver
     path: examples/python/pydantic_ai_ticket_resolver
     public_docs:

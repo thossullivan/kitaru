@@ -4,6 +4,8 @@
 
 Use [`python/pydantic_ai_ticket_resolver/`](python/pydantic_ai_ticket_resolver/) for the maintained product walkthrough. It provides a ready PydanticAI returns agent and checked-in Langfuse traces. Its README owns setup and import; the [complete tutorial](../docs/book/tutorials/returns-agent/README.md) continues through deterministic diagnostics, evidence-linked human review, an immutable cohort version, and bounded replay.
 
+Use [`python/pydantic_ai_returns_operations/`](python/pydantic_ai_returns_operations/) for the larger Kaizen demonstration corpus. It keeps the quickstart unchanged while adding multi-item orders, interacting policy failures, a discovery/held-out split, resumable provider runs, optional Langfuse export, and correctness-gated efficiency scoring.
+
 ## Python adapter examples
 
 The Python adapter examples use packages from the independent plugin workspace:
