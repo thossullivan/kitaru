@@ -8,7 +8,7 @@ icon: robot
 The Kitaru Mastra adapter wraps an existing Mastra `Agent` and records `generate()` calls and supported streams as Kitaru [sessions](../concepts/agents-and-sessions.md). Mastra still runs the agent and Kitaru returns the native Mastra result unchanged.
 
 {% hint style="warning" %}
-`@zenml-io/kitaru-mastra` supports Node `>=22.22.0 <23 || >=26 <27`. `Agent.generate()` supports `@mastra/core >=1.51.0 <1.68.0`; recorded `Agent.stream()` calls require a stable Mastra 1.67.x release.
+`@zenml-io/kitaru-mastra` supports Node `>=22.22.0 <23 || >=24 <25 || >=26 <27`. `Agent.generate()` supports `@mastra/core >=1.51.0 <1.68.0`; recorded `Agent.stream()` calls require a stable Mastra 1.67.x release.
 {% endhint %}
 
 To bring in runs already recorded by Mastra, use [Import existing Mastra traces](#import-existing-mastra-traces). Importing an export does not require the original run to have used `KitaruAgent`.
@@ -307,7 +307,7 @@ The importer accepts selected files only; it does not fetch traces or live memor
 
 The [Mastra support-triage example](https://github.com/zenml-io/kitaru/tree/main/examples/typescript/mastra_support_triage) includes two entry points. Its existing worker command records a real `generate()` call and replays it with prompt, instruction, model-setting, and history-policy overrides. Its `stream` command uses a provider-free deterministic Mastra model and local order lookup to print two native text chunks while Kitaru records the final run.
 
-Use Node 22 or Node 26 and a running Kitaru API backed by PostgreSQL. The deterministic stream needs an existing agent ID and no provider credential:
+Use Node 22, Node 24, or Node 26 and a running Kitaru API backed by PostgreSQL. The deterministic stream needs an existing agent ID and no provider credential:
 
 ```bash
 pnpm install --frozen-lockfile
