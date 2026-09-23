@@ -30,6 +30,7 @@ async function fixture(
     resourceId: RESOURCE,
     exclusiveAccess: access,
     recordMutation,
+    getRequestId: () => "request-1",
   });
   return { runtime, binding, recordMutation };
 }
@@ -213,5 +214,20 @@ it("marks credential-altered mutation evidence incomplete but keeps native argum
     "private-value",
   );
   expect(recordMutation.mock.calls[0]?.[0]).toMatchObject({ complete: false });
+  await binding.release();
+});
+
+it("rejects same-invocation writes that interleave with initial snapshot reads", async () => {
+  const { runtime, binding } = await fixture();
+  const native = runtime.domain.getThreadById.bind(runtime.domain);
+  vi.spyOn(runtime.domain, "getThreadById").mockImplementationOnce(
+    async (args) => {
+      const thread = await native(args);
+      await binding.domain.updateThread({ id: THREAD, title: "interleaved" });
+      return thread;
+    },
+  );
+  expect(await binding.captureInitial(runtime.memory)).toBeUndefined();
+  expect(binding.incompleteReasons.join()).toMatch(/overlapped initial/);
   await binding.release();
 });

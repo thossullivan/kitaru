@@ -79,6 +79,8 @@ export interface MastraMemoryCaptureBinding {
 // The pinned public MemoryStorage mutation inventory. Delegation binds `this` to
 // the original domain, so a native method's own helper calls record only once.
 const MUTATIONS = new Set<keyof MemoryStorage>([
+  "dangerouslyClearAll",
+  "prune",
   "saveThread",
   "updateThread",
   "patchThread",
@@ -115,6 +117,7 @@ export function createMemoryCaptureBinding(
   let revision = 0;
   let started = false;
   let capturing = false;
+  let readingSnapshot = false;
   let released = false;
   let releaseLease: (() => Promise<void>) | undefined;
   let mutations = Promise.resolve();
@@ -158,6 +161,12 @@ export function createMemoryCaptureBinding(
         if (!started || released)
           markIncomplete(
             "Memory mutation occurred outside the owned invocation lifecycle.",
+          );
+        if (readingSnapshot)
+          markIncomplete("Memory mutation overlapped initial snapshot reads.");
+        if (property === "dangerouslyClearAll" || property === "prune")
+          markIncomplete(
+            "Storage-wide mutation is outside the captured thread scope.",
           );
         const duringCapture = capturing;
         const result = mutations.then(async () => {
@@ -271,6 +280,7 @@ export function createMemoryCaptureBinding(
         }
         await memory.settled();
         await mutations;
+        readingSnapshot = true;
         const thread = await options.domain.getThreadById({
           threadId: options.threadId,
         });
@@ -304,6 +314,7 @@ export function createMemoryCaptureBinding(
         return undefined;
       } finally {
         capturing = false;
+        readingSnapshot = false;
       }
     },
     drain,
