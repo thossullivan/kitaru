@@ -1,6 +1,7 @@
 import { createRequire } from "node:module";
 import type { JsonValue, KitaruClient } from "@zenml-io/kitaru";
 import {
+  type AdapterRunState,
   parseModelSettings,
   type ReplayContext,
   type RunRecorder,
@@ -21,6 +22,7 @@ import {
   assertReplayToolCoverage,
   stripLiveMemoryOptions,
 } from "./replay-guards.js";
+import type { RequestEvidence } from "./request-capture.js";
 import { type RecordedStep, recordStep } from "./step-recorder.js";
 import { createToolHooks } from "./tool-policies.js";
 import type {
@@ -37,7 +39,17 @@ type StreamAgent = {
   listConfiguredInputProcessors?: (requestContext?: unknown) => unknown;
 };
 
+export class StatefulRecordingError extends Error {}
+
+export interface StatefulStreamRecording {
+  input: JsonValue;
+  initialize(state: AdapterRunState): void;
+  takeRequest(): RequestEvidence | undefined;
+  finish(): Promise<void>;
+}
+
 interface StreamRecordingOptions {
+  stateful?: StatefulStreamRecording;
   adapterVersion: string;
   agent: StreamAgent;
   callerMessages: unknown;
@@ -196,6 +208,7 @@ class StreamLifecycle {
   constructor(
     readonly recorder: RunRecorder,
     readonly options: KitaruAgentOptions,
+    readonly stateful?: StatefulStreamRecording,
   ) {}
 
   async record(step: RecordedStep): Promise<void> {
@@ -207,6 +220,7 @@ class StreamLifecycle {
         step,
         this.options.costCalculator,
         this.options.recordingLimits,
+        this.stateful?.takeRequest(),
       ),
     );
     this.#stepTail = write.catch((error: unknown) => {
@@ -273,6 +287,13 @@ class StreamLifecycle {
   private async finalize(complete: boolean, result?: unknown): Promise<void> {
     this.#finalizerPromise ??= (async () => {
       await this.#stepTail;
+      try {
+        await this.stateful?.finish();
+      } catch (error) {
+        if (error instanceof StatefulRecordingError)
+          this.requestRecordingFailure("complete", error);
+        else this.requestFailure(error);
+      }
       if (this.#recordingError !== undefined) {
         await this.cleanup(this.#recordingError.error, "recording");
         return;
@@ -331,6 +352,7 @@ class StreamLifecycle {
 }
 
 export async function streamWithRecording({
+  stateful,
   adapterVersion,
   agent,
   callerMessages,
@@ -355,8 +377,10 @@ export async function streamWithRecording({
     : {};
   const { deepMerge } = await import("@mastra/core/utils");
   const effective = deepMerge(defaults, callerOptions) as RuntimeStreamOptions;
-  const needsContext = hasMemoryOptions(effective);
-  const contextMessages = restoreConversationContext(replayInput);
+  const needsContext = !stateful && hasMemoryOptions(effective);
+  const contextMessages = stateful
+    ? undefined
+    : restoreConversationContext(replayInput);
   if (contextMessages && !replay.spec) {
     throw new Error(
       "A recorded Mastra conversation context can only be restored through a Kitaru replay. Start a replay for this session to keep live memory isolated.",
@@ -380,7 +404,7 @@ export async function streamWithRecording({
     effective.context = [];
   }
   let replayAbortController: AbortController | undefined;
-  if (replay.replacementModelId !== undefined) {
+  if (!stateful && replay.replacementModelId !== undefined) {
     if (!options.resolveModel) {
       throw new Error(
         `Cannot resolve replacement model '${replay.replacementModelId}' without resolveModel`,
@@ -395,6 +419,7 @@ export async function streamWithRecording({
     effective.model = resolved;
   }
   if (
+    !stateful &&
     replay.override?.system_prompt !== undefined &&
     replay.override.system_prompt !== null
   ) {
@@ -419,13 +444,15 @@ export async function streamWithRecording({
           replayAbortController.signal,
         ])
       : replayAbortController.signal;
-    stripLiveMemoryOptions(effective);
-    await assertReplayToolCoverage({
-      agent,
-      methodType: "stream",
-      runtimeOptions: effective,
-      spec: replay.spec,
-    });
+    if (!stateful) {
+      stripLiveMemoryOptions(effective);
+      await assertReplayToolCoverage({
+        agent,
+        methodType: "stream",
+        runtimeOptions: effective,
+        spec: replay.spec,
+      });
+    }
     effective.toolCallConcurrency = 1;
   }
   const processors =
@@ -434,6 +461,7 @@ export async function streamWithRecording({
       ? await agent.listConfiguredInputProcessors(effective.requestContext)
       : undefined);
   if (
+    !stateful &&
     processors != null &&
     (!Array.isArray(processors) || processors.length > 0)
   ) {
@@ -444,9 +472,10 @@ export async function streamWithRecording({
   await assertSupportedOptions(agent, effective);
 
   let recordedInput =
-    needsContext && !replay.spec
+    stateful?.input ??
+    (needsContext && !replay.spec
       ? createContextInput(replayInput)
-      : replayInput;
+      : replayInput);
   let lifecycle: StreamLifecycle | undefined;
   let initializePromise: Promise<StreamLifecycle> | undefined;
   const initialize = (): Promise<StreamLifecycle> => {
@@ -473,7 +502,8 @@ export async function streamWithRecording({
         await recorder.fail(error).catch(() => undefined);
         throw error;
       }
-      lifecycle = new StreamLifecycle(recorder, options);
+      stateful?.initialize(recorder.state);
+      lifecycle = new StreamLifecycle(recorder, options, stateful);
       return lifecycle;
     })();
     return initializePromise;
@@ -592,12 +622,13 @@ export async function streamWithRecording({
       limits: options.recordingLimits,
       state: (await initialize()).recorder.state,
     });
-  effective.hooks = {
-    beforeToolCall: async (event) =>
-      (await getToolHooks()).beforeToolCall?.(event),
-    afterToolCall: async (event) =>
-      (await getToolHooks()).afterToolCall?.(event),
-  };
+  if (!stateful)
+    effective.hooks = {
+      beforeToolCall: async (event) =>
+        (await getToolHooks()).beforeToolCall?.(event),
+      afterToolCall: async (event) =>
+        (await getToolHooks()).afterToolCall?.(event),
+    };
 
   try {
     return await agent.stream(effectiveMessages, effective);

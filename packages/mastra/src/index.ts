@@ -32,6 +32,13 @@ export type {
 } from "./scorers.js";
 export { createMastraEvaluator } from "./scorers.js";
 export type {
+  MemoryReplayAgentBindings,
+  MemoryReplayAgentFactory,
+  MemoryReplayAgentOptions,
+} from "./stateful-agent.js";
+
+export { createMemoryReplayAgent } from "./stateful-agent.js";
+export type {
   ConfiguredAfterToolCall,
   ConfiguredBeforeToolCall,
   ConfiguredOnStepFinish,

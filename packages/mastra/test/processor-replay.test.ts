@@ -1,0 +1,431 @@
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { InputProcessor } from "@mastra/core/processors";
+import { MastraLanguageModelV2Mock } from "@mastra/core/test-utils/llm-mock";
+import { createTool } from "@mastra/core/tools";
+import { afterEach, expect, it, vi } from "vitest";
+import { z } from "zod/v4";
+import {
+  createMemoryReplayAgent,
+  createProcessLocalMemoryAccess,
+  MEMORY_REPLAY_KEY,
+} from "../src/index.js";
+import {
+  createMemoryRuntime,
+  FILE_URL,
+  RESOURCE,
+  seedMemory,
+  streamParts,
+  THREAD,
+  textStream,
+} from "./helpers/memory-agent.js";
+import {
+  AGENT_ID,
+  installTestApi,
+  ORIGINAL_SESSION_ID,
+  REPLAY_ID,
+} from "./helpers.js";
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
+
+it("runs the native file processor with historical bytes, skills and complete large request evidence", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "kitaru-stateful-files-"));
+  await mkdir(join(directory, "triage"));
+  await writeFile(
+    join(directory, "triage", "SKILL.md"),
+    "---\nname: triage\ndescription: HISTORICAL_SKILL.\n---\nUse historical knowledge.\n",
+  );
+  const runtime = createMemoryRuntime({ messageTokens: 100000 });
+  await seedMemory(runtime);
+  const nativeFetch = globalThis.fetch;
+  const api = installTestApi({
+    replaySpec: {
+      id: REPLAY_ID,
+      baseline_session_id: ORIGINAL_SESSION_ID,
+      status: "pending",
+      override: { system_prompt: "Changed application instruction" },
+      tool_policy: {
+        default: { type: "history", on_miss: "fail", scope: "baseline" },
+        tools: {},
+      },
+    },
+  });
+  const apiFetch = globalThis.fetch;
+  vi.stubGlobal("fetch", ((
+    input: Parameters<typeof fetch>[0],
+    init: Parameters<typeof fetch>[1],
+  ) =>
+    String(input).startsWith("data:")
+      ? nativeFetch(input, init)
+      : apiFetch(input, init)) as typeof fetch);
+  const requests: unknown[] = [];
+  const bytes = new Uint8Array(40000).fill(65);
+  const fetchFile = vi.fn(async () => ({
+    bytes,
+    mediaType: "application/pdf",
+  }));
+  const processFile = vi.fn();
+  const model = new MastraLanguageModelV2Mock({
+    modelId: "actor",
+    provider: "fixture",
+    doStream: async (args) => {
+      requests.push(args);
+      return textStream("done");
+    },
+  });
+  const adapter = createMemoryReplayAgent(
+    ({ memory, workspace, resolveFile }) => ({
+      id: "files",
+      name: "Files",
+      instructions: "Original application instruction",
+      model,
+      memory,
+      workspace,
+      inputProcessors: [
+        {
+          id: "file-content",
+          async processInput({ messages }) {
+            processFile();
+            const content = await resolveFile(FILE_URL);
+            return messages.map((message) => ({
+              ...message,
+              content: {
+                ...message.content,
+                parts: message.content.parts.map((part) =>
+                  part.type === "file"
+                    ? {
+                        ...part,
+                        data: Buffer.from(content.bytes).toString("base64"),
+                      }
+                    : part,
+                ),
+              },
+            }));
+          },
+        },
+      ],
+    }),
+    {
+      agentId: AGENT_ID,
+      apiUrl: "https://kitaru.invalid",
+      requestedModelId: "fixture/actor",
+      sourceMemory: () => ({
+        settled: () => runtime.memory.settled(),
+        domain: runtime.domain,
+        configuration: runtime.memory.getMergedThreadConfig(),
+        exclusiveAccess: createProcessLocalMemoryAccess(),
+      }),
+      resolveModel: async (id) =>
+        id.includes("observer")
+          ? runtime.observer.model
+          : id.includes("reflector")
+            ? runtime.reflector.model
+            : model,
+      files: [FILE_URL],
+      resolveFile: fetchFile,
+      skillsDirectory: directory,
+    },
+  );
+  try {
+    const baseline = await adapter.stream(
+      [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Please read" },
+            {
+              type: "file",
+              data: new URL(FILE_URL),
+              mimeType: "application/pdf",
+            },
+          ],
+        },
+      ],
+      {
+        memory: { thread: THREAD, resource: RESOURCE },
+        system: "Extra context",
+      },
+    );
+    await baseline.consumeStream();
+    const input = api.calls.find(
+      (call) => call.path === "/api/v1/sessions" && call.method === "POST",
+    )?.body?.inputs;
+    expect(
+      (input as Record<string, { complete: boolean }>)[MEMORY_REPLAY_KEY]
+        ?.complete,
+    ).toBe(true);
+    expect(
+      api.calls.filter((call) => call.method === "PATCH").at(-1)?.body?.status,
+    ).toBe("completed");
+    fetchFile.mockRejectedValue(new Error("Original file unavailable"));
+    vi.stubEnv("KITARU_REPLAY_ID", REPLAY_ID);
+    vi.stubEnv("KITARU_TASK_INPUTS", JSON.stringify(input));
+    const replay = await adapter.stream("ignored");
+    await replay.consumeStream();
+    expect(fetchFile).toHaveBeenCalledTimes(1);
+    expect(processFile).toHaveBeenCalledTimes(2);
+    const json = JSON.stringify(requests[1]);
+    expect(json).toContain("HISTORICAL_SKILL");
+    expect(json).toContain("historical-blue");
+    expect(json).toContain("Extra context");
+    expect(json).toContain("Changed application instruction");
+    const modelNodes = api
+      .nodeBatches()
+      .flat()
+      .filter((node) => node.node_type === "llm_call");
+    expect(modelNodes).toHaveLength(2);
+    expect(
+      modelNodes.every(
+        (node) =>
+          (node.attributes as Record<string, unknown>).request_complete ===
+          true,
+      ),
+    ).toBe(true);
+    expect(JSON.stringify(modelNodes[1]?.inputs).length).toBeGreaterThan(40000);
+  } finally {
+    await runtime.store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+it.each(["late", "memory-name-spoof", "copied-memory-id"])(
+  "applies history failure to a %s processor tool before it can execute",
+  async (kind) => {
+    const runtime = createMemoryRuntime({ messageTokens: 10000 });
+    await seedMemory(runtime);
+    const api = installTestApi({
+      replaySpec: {
+        id: REPLAY_ID,
+        baseline_session_id: ORIGINAL_SESSION_ID,
+        status: "pending",
+        override: null,
+        tool_policy: {
+          default: { type: "history", on_miss: "fail", scope: "baseline" },
+          tools: {},
+        },
+      },
+    });
+    let replaying = false;
+    const execute = vi.fn(async () => ({ sideEffect: true }));
+    const toolName = kind === "late" ? "lateTool" : "updateWorkingMemory";
+    const processor: InputProcessor = {
+      id: "late-tool",
+      processInputStep({ tools }) {
+        return {
+          tools: {
+            ...tools,
+            [toolName]:
+              kind === "copied-memory-id"
+                ? {
+                    ...(tools?.updateWorkingMemory as Record<string, unknown>),
+                    execute,
+                  }
+                : createTool({
+                    id: toolName,
+                    description: "An external tool",
+                    inputSchema: z.object({}),
+                    execute,
+                  }),
+          },
+        };
+      },
+    };
+    const model = new MastraLanguageModelV2Mock({
+      modelId: "actor",
+      provider: "fixture",
+      doStream: async () =>
+        replaying
+          ? streamParts(
+              [
+                {
+                  type: "tool-call",
+                  toolName,
+                  toolCallId: "external-call",
+                  input: "{}",
+                },
+              ],
+              "tool-calls",
+            )
+          : textStream("baseline"),
+    });
+    const adapter = createMemoryReplayAgent(
+      ({ memory }) => ({
+        id: "late",
+        name: "Late",
+        instructions: "Use a tool",
+        model,
+        memory,
+        inputProcessors: [processor],
+      }),
+      {
+        agentId: AGENT_ID,
+        apiUrl: "https://kitaru.invalid",
+        requestedModelId: "fixture/actor",
+        sourceMemory: () => ({
+          settled: () => runtime.memory.settled(),
+          domain: runtime.domain,
+          configuration: runtime.memory.getMergedThreadConfig(),
+          exclusiveAccess: createProcessLocalMemoryAccess(),
+        }),
+        resolveModel: async (id) =>
+          id.includes("observer")
+            ? runtime.observer.model
+            : id.includes("reflector")
+              ? runtime.reflector.model
+              : model,
+      },
+    );
+    const baseline = await adapter.stream("record", {
+      memory: { thread: THREAD, resource: RESOURCE },
+    });
+    await baseline.consumeStream();
+    const input = api.calls.find(
+      (call) => call.path === "/api/v1/sessions" && call.method === "POST",
+    )?.body?.inputs;
+    vi.stubEnv("KITARU_REPLAY_ID", REPLAY_ID);
+    vi.stubEnv("KITARU_TASK_INPUTS", JSON.stringify(input));
+    replaying = true;
+    const result = await adapter.stream("ignored");
+    await result.consumeStream();
+    await vi.waitFor(() =>
+      expect(
+        api.calls.filter((call) => call.method === "PATCH").at(-1)?.body
+          ?.status,
+      ).toBe("failed"),
+    );
+    expect(execute).not.toHaveBeenCalled();
+    expect(
+      api.calls.filter((call) => call.path.endsWith("tool-lookup")),
+    ).toHaveLength(1);
+    await runtime.store.close();
+  },
+);
+
+it("keeps policies separate when processor tools share the same executor", async () => {
+  const runtime = createMemoryRuntime({ messageTokens: 10000 });
+  await seedMemory(runtime);
+  const staticPolicy = (result: string) => ({
+    type: "static",
+    on_miss: "fail",
+    cases: [{ match: null, match_mode: "exact", result }],
+  });
+  const api = installTestApi({
+    replaySpec: {
+      id: REPLAY_ID,
+      baseline_session_id: ORIGINAL_SESSION_ID,
+      status: "pending",
+      override: null,
+      tool_policy: {
+        default: { type: "history", on_miss: "fail", scope: "baseline" },
+        tools: {
+          firstAlias: staticPolicy("FIRST"),
+          secondAlias: staticPolicy("SECOND"),
+        },
+      },
+    },
+  });
+  let replaying = false;
+  let step = 0;
+  const execute = vi.fn(async () => "live");
+  const model = new MastraLanguageModelV2Mock({
+    modelId: "actor",
+    provider: "fixture",
+    doStream: async () =>
+      replaying && step++ === 0
+        ? streamParts(
+            [
+              {
+                type: "tool-call",
+                toolName: "firstAlias",
+                toolCallId: "first",
+                input: "{}",
+              },
+              {
+                type: "tool-call",
+                toolName: "secondAlias",
+                toolCallId: "second",
+                input: "{}",
+              },
+            ],
+            "tool-calls",
+          )
+        : textStream("done"),
+  });
+  const adapter = createMemoryReplayAgent(
+    ({ memory }) => ({
+      id: "aliases",
+      name: "Aliases",
+      instructions: "Use tools",
+      model,
+      memory,
+      inputProcessors: [
+        {
+          id: "aliases",
+          processInputStep({ tools }) {
+            return {
+              tools: {
+                ...tools,
+                firstAlias: createTool({
+                  id: "firstAlias",
+                  description: "First",
+                  inputSchema: z.object({}),
+                  execute,
+                }),
+                secondAlias: createTool({
+                  id: "secondAlias",
+                  description: "Second",
+                  inputSchema: z.object({}),
+                  execute,
+                }),
+              },
+            };
+          },
+        },
+      ],
+    }),
+    {
+      agentId: AGENT_ID,
+      apiUrl: "https://kitaru.invalid",
+      requestedModelId: "fixture/actor",
+      sourceMemory: () => ({
+        settled: () => runtime.memory.settled(),
+        domain: runtime.domain,
+        configuration: runtime.memory.getMergedThreadConfig(),
+        exclusiveAccess: createProcessLocalMemoryAccess(),
+      }),
+      resolveModel: async (id) =>
+        id.includes("observer")
+          ? runtime.observer.model
+          : id.includes("reflector")
+            ? runtime.reflector.model
+            : model,
+    },
+  );
+  const baseline = await adapter.stream("record", {
+    memory: { thread: THREAD, resource: RESOURCE },
+  });
+  await baseline.consumeStream();
+  const input = api.calls.find(
+    (call) => call.path === "/api/v1/sessions" && call.method === "POST",
+  )?.body?.inputs;
+  vi.stubEnv("KITARU_REPLAY_ID", REPLAY_ID);
+  vi.stubEnv("KITARU_TASK_INPUTS", JSON.stringify(input));
+  replaying = true;
+  const replay = await adapter.stream("ignored");
+  await replay.consumeStream();
+  const tools = api
+    .nodeBatches(api.sessionIds[1])
+    .flat()
+    .filter((node) => node.node_type === "tool_call");
+  expect(tools.map((node) => [node.name, node.outputs])).toEqual([
+    ["firstAlias", "FIRST"],
+    ["secondAlias", "SECOND"],
+  ]);
+  expect(execute).not.toHaveBeenCalled();
+  await runtime.store.close();
+});

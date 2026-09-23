@@ -21,6 +21,7 @@ import type {
 } from "./types.js";
 
 interface ToolHookOptions {
+  trustedMemoryTool?: boolean;
   abortReplay?: (reason: unknown) => void;
   callerHooks?: ToolHooks;
   configuredAfterToolCall?: ConfiguredAfterToolCall;
@@ -107,7 +108,7 @@ export function createToolHooks(options: ToolHookOptions): ToolHooks {
           `tool '${hookContext.toolName}' input`,
           limits,
         );
-        if (state.spec) {
+        if (state.spec && !options.trustedMemoryTool) {
           const decision = await decideToolCall(state, {
             callId,
             inputs: converted.value,
