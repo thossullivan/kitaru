@@ -57,23 +57,18 @@ import {
 } from "./stream-recording.js";
 import type { KitaruAgentOptions, RuntimeStreamOptions } from "./types.js";
 
+interface MastraMemorySource {
+  settled(): Promise<void>;
+  domain: MemoryStorage;
+  configuration: MemoryConfigInternal;
+  exclusiveAccess: MastraExclusiveMemoryAccess;
+}
+
 export interface MemoryReplayAgentOptions extends KitaruAgentOptions {
   /** Registry context passed to baseline dynamic configuration resolvers. */
   mastra?: Mastra;
   /** Called only for new recordings. All writers must share exclusiveAccess. */
-  sourceMemory():
-    | Promise<{
-        settled(): Promise<void>;
-        domain: MemoryStorage;
-        configuration: MemoryConfigInternal;
-        exclusiveAccess: MastraExclusiveMemoryAccess;
-      }>
-    | {
-        settled(): Promise<void>;
-        domain: MemoryStorage;
-        configuration: MemoryConfigInternal;
-        exclusiveAccess: MastraExclusiveMemoryAccess;
-      };
+  sourceMemory(): MastraMemorySource | Promise<MastraMemorySource>;
   /** Return only approved replay-relevant JSON context. Credentials are forbidden. */
   captureRequestContext?(context: RequestContext): Record<string, unknown>;
   files?: readonly string[];

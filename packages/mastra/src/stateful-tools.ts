@@ -98,16 +98,15 @@ export function createStatefulToolProcessors(options: {
         let wrapper = wrappers.get(execute);
         if (!wrapper) {
           const isMemory = trusted.has(execute);
+          const hooks = createToolHooks({
+            state,
+            abortReplay: options.abort,
+            trustedMemoryTool: isMemory,
+            configuredBeforeToolCall: options.adapter.configuredBeforeToolCall,
+            configuredAfterToolCall: options.adapter.configuredAfterToolCall,
+            limits: options.adapter.recordingLimits,
+          });
           wrapper = async (input: unknown, context: unknown) => {
-            const hooks = createToolHooks({
-              state: options.getState(),
-              abortReplay: options.abort,
-              trustedMemoryTool: isMemory,
-              configuredBeforeToolCall:
-                options.adapter.configuredBeforeToolCall,
-              configuredAfterToolCall: options.adapter.configuredAfterToolCall,
-              limits: options.adapter.recordingLimits,
-            });
             const event = { toolName: name, input, context, metadata: {} };
             const before = await hooks.beforeToolCall?.(event);
             if (before?.proceed === false) return before.output;
