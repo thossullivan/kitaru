@@ -473,7 +473,10 @@ export function createMemoryReplayAgent(
             stepNumber: args.stepNumber,
             messageList: args.messageList,
             applicationInstructions,
-            extraContext: effective.system ?? null,
+            extraContext: {
+              system: effective.system ?? null,
+              context: effective.context ?? [],
+            },
           });
           const resolved = await resolveModelConfig(args.model, requestContext);
           return {

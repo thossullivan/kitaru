@@ -200,7 +200,9 @@ it("records and replays native evolving memory without re-resolving live configu
   );
   const baseline = await adapter.stream("Green please", {
     memory: { thread: THREAD, resource: RESOURCE },
-    system: "Extra context. Original instructions",
+    context: [
+      { role: "system", content: "Extra context. Original instructions" },
+    ],
   });
   await baseline.consumeStream();
   expect(dynamicCalls).toEqual(["instructions", "model", "defaults"]);
@@ -221,6 +223,11 @@ it("records and replays native evolving memory without re-resolving live configu
       .filter((node) => node.node_type === "llm_call")
       .every((node) => node.inputs),
   ).toBe(true);
+  expect(
+    baselineNodes.find((node) => node.node_type === "llm_call")?.attributes,
+  ).toHaveProperty("prompt_provenance.extraContext.context", [
+    { role: "system", content: "Extra context. Original instructions" },
+  ]);
   await runtime.memory.updateWorkingMemory({
     threadId: THREAD,
     resourceId: RESOURCE,
