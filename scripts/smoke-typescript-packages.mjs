@@ -1,4 +1,10 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  copyFileSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -441,11 +447,25 @@ function smokeConsumer({ artifactRoot, mastraVersion, npmCache }) {
       npmCache,
       ...tarballs,
       `@mastra/core@${mastraVersion}`,
+      ...(mastraVersion === upperMastraVersion
+        ? ["@mastra/memory@1.30.0"]
+        : []),
       "ai@7.0.65",
       "zod@3.25.76",
     ],
     consumerRoot,
   );
+  if (mastraVersion === lowerMastraVersion) {
+    run(
+      process.execPath,
+      [
+        "--input-type=module",
+        "--eval",
+        "try { import.meta.resolve('@mastra/memory'); throw new Error('Optional memory dependency unexpectedly installed'); } catch (error) { if (error.code !== 'ERR_MODULE_NOT_FOUND') throw error; }",
+      ],
+      consumerRoot,
+    );
+  }
   run(process.execPath, ["index.mjs"], consumerRoot);
   run(
     join(repositoryRoot, "node_modules", ".bin", "tsc"),
@@ -461,6 +481,26 @@ function smokeConsumer({ artifactRoot, mastraVersion, npmCache }) {
     );
   }
   run(process.execPath, ["stream.mjs", mastraVersion], consumerRoot);
+  if (mastraVersion === upperMastraVersion) {
+    copyFileSync(
+      join(repositoryRoot, "scripts/fixtures/mastra-memory-smoke.mjs"),
+      join(consumerRoot, "memory.mjs"),
+    );
+    copyFileSync(
+      join(repositoryRoot, "scripts/fixtures/mastra-memory-types.ts"),
+      join(consumerRoot, "memory.ts"),
+    );
+    writeFileSync(
+      join(consumerRoot, "tsconfig.memory.json"),
+      JSON.stringify({ extends: "./tsconfig.stream.json", include: ["memory.ts"] }),
+    );
+    run(
+      join(repositoryRoot, "node_modules", ".bin", "tsc"),
+      ["-p", "tsconfig.memory.json"],
+      consumerRoot,
+    );
+    run(process.execPath, ["memory.mjs"], consumerRoot);
+  }
 }
 
 const outputDirectory = parseOutputDirectory(process.argv.slice(2));

@@ -2,6 +2,8 @@
 
 Experimental recording and replay support for Mastra. `generate()` supports `@mastra/core >=1.51.0 <1.68.0`; recorded and replayed `stream()` calls require a stable `@mastra/core 1.67.x` release.
 
+For native working and observational memory, use the opt-in [isolated memory replay factory](#isolated-memory-replay) on exact Mastra core 1.67.0 and memory 1.30.0.
+
 This adapter depends on the framework-neutral `@zenml-io/kitaru` package, whose repository directory is `packages/core/`. The packages are versioned and released together.
 
 ```bash
@@ -67,7 +69,7 @@ Failed sessions store a bounded failure category rather than the raw provider or
 
 Mastra 1.67 continues model execution in the background when the application stops reading or cancels its reader. Kitaru records the eventual finish callback and completed result in that case. Kitaru does not drain the returned reader itself. After queued steps settle, the finish callback chooses the terminal status once. An error or abort observed before that decision records failure; a later abort cannot reverse completion because the API does not reopen terminal sessions.
 
-## Recording
+## Recording with `KitaruAgent`
 
 Each call creates isolated run state and:
 
@@ -111,7 +113,7 @@ const recorded = new KitaruAgent(existingAgent, {
 
 Each LLM node carries a `cost` attribute recording where the number came from: `disabled` with no calculator, `estimated` for a calculated value, and `unavailable` when the calculator throws or returns nothing. A throwing calculator never fails the run.
 
-## Replay
+## Replay with `KitaruAgent`
 
 When `KITARU_REPLAY_ID` is set, `generate()` or `stream()` fetches the replay and applies its model, system-instruction, model-parameter, and tool-policy overrides through public per-run options and tool hooks. The stream entrypoint still returns Mastra's native result; callers must consume it through completion so Kitaru can finalize the replay session.
 
@@ -143,6 +145,142 @@ Supported tool policies are passthrough, static, and history, including `fail`, 
 
 History matching is guaranteed only for traces recorded and replayed through this Mastra adapter. Another framework may validate, default, or serialize the same logical tool input differently, so cross-framework history replay is not a compatibility promise.
 
+## Isolated memory replay
+
+Use `createMemoryReplayAgent()` when a consumed stream needs thread-scoped schema working memory, observational memory, or controlled input processors. This opt-in factory requires exactly `@mastra/core@1.67.0` and `@mastra/memory@1.30.0`. The existing `KitaruAgent` wrapper keeps its history-only memory behavior.
+
+```bash
+pnpm add @zenml-io/kitaru-mastra @mastra/core@1.67.0 @mastra/memory@1.30.0 zod
+```
+
+The factory creates a fresh native agent for each invocation. For a baseline, it binds native memory to your source storage and records the starting state before recall. For a replay, it restores that state into a separate in-memory store. Native working-memory tools and observation/reflection jobs then evolve the isolated state as the model runs again. Replay never calls `sourceMemory()`.
+
+The following binding uses a process-local store. Supply your existing public memory storage domain and its complete configuration for a persistent application:
+
+```ts
+import { InMemoryStore } from "@mastra/core/storage";
+import { Memory } from "@mastra/memory";
+import {
+  createMemoryReplayAgent,
+  createProcessLocalMemoryAccess,
+} from "@zenml-io/kitaru-mastra";
+import { z } from "zod";
+
+const store = new InMemoryStore();
+const sourceMemory = new Memory({
+  storage: store,
+  options: {
+    semanticRecall: false,
+    workingMemory: {
+      enabled: true,
+      scope: "thread",
+      schema: z.object({ preference: z.string() }),
+    },
+  },
+});
+// Share this same instance with every writer, for the lifetime of the store.
+const exclusiveAccess = createProcessLocalMemoryAccess();
+const recorded = createMemoryReplayAgent(
+  ({ memory }) => ({
+    id: "support",
+    name: "Support",
+    memory,
+    instructions: () => "Remember the user's preferences.",
+    model: () => "openai/gpt-5-mini",
+    defaultOptions: () => ({ maxSteps: 3 }),
+  }),
+  {
+    agentId: process.env.KITARU_AGENT_ID!,
+    requestedModelId: "openai/gpt-5-mini",
+    allowedReplayModels: ["openai/gpt-5-mini"],
+    sourceMemory: () => ({
+      domain: store.stores.memory!,
+      configuration: sourceMemory.getMergedThreadConfig(),
+      settled: () => sourceMemory.settled(),
+      exclusiveAccess,
+    }),
+    resolveModel: (id) => {
+      if (id !== "openai/gpt-5-mini") throw new Error(`Unknown model: ${id}`);
+      return "openai/gpt-5-mini";
+    },
+  },
+);
+const output = await recorded.stream("My preference is green.", {
+  memory: { thread: "support-thread", resource: "customer-123" },
+  context: [{ role: "system", content: "The customer is asking about preferences." }],
+});
+await output.consumeStream();
+await store.close();
+```
+
+Run this entrypoint with `KITARU_API_URL`, a Kitaru credential, an existing `KITARU_AGENT_ID`, and the model provider credential. Register the compiled command as the agent version's run specification to run it through a worker. The same command serves baseline and replay tasks; the worker supplies the recorded input and replay identity.
+
+All source-memory writers must participate in the same exclusive-access mechanism. The process-local helper is suitable only when every writer shares that instance in one process. Use a distributed implementation of `MastraExclusiveMemoryAccess` when other processes can write. Its `acquire()` method must hold access until the returned release function runs. `settled()` must join pending work on the source `Memory` instance; it is not a lock. Configure working and observational memory with `scope: "thread"`; resource-scoped state, semantic recall, automatic title generation, and per-call `memory.options` are outside this contract.
+
+Dynamic `instructions`, `model`, and `defaultOptions` resolve once during baseline setup. Replay uses their recorded values instead of calling those resolvers again. `resolveModel` must resolve the recorded actor, observer, and reflector model identifiers as well as any allowed actor override. A `system_prompt` override replaces only application instructions and retains recorded extra system context. Model and model-setting overrides affect the actor; observation and reflection retain their recorded configuration. Raw-input `prompt` overrides are rejected; record a new baseline to change invocation input.
+
+### Create and inspect a memory replay
+
+After the worker records a complete baseline, create a replay using an existing evaluator:
+
+```bash
+kitaru replay create <baseline-session-id> \
+  --evaluator your-evaluator@1 \
+  --override '{"system_prompt":"Use the recorded preferences when answering."}' \
+  --tool-policy '{"default":{"type":"history","scope":"baseline","on_miss":"fail"},"tools":{}}' \
+  --output json
+kitaru job watch <job-id>
+kitaru replay get <replay-id> --output json
+kitaru session get <result-session-id> --output json
+kitaru session nodes <result-session-id> --include-payloads --output json
+```
+
+Read `result_session_id` from the replay, check the session's final status, and inspect its model-request and memory-mutation nodes. `session nodes` returns one page; follow `page.next_cursor` with `--cursor` while `page.has_more` is true.
+
+The Python SDK uses the same replay request. Given an authenticated `client`, a baseline UUID, and an existing evaluator:
+
+```python
+from kitaru.api_models.v1.plugin import EvaluatorConfig
+from kitaru.api_models.v1.replay import ReplayCreateRequest
+from kitaru.api_models.v1.replay_config import ReplayOverride, ToolPolicy
+
+replay = await client.replays.create(
+    ReplayCreateRequest(
+        baseline_session_id=baseline_id,
+        override=ReplayOverride(system_prompt="Use the recorded preferences."),
+        tool_policy=ToolPolicy.model_validate({
+            "default": {"type": "history", "scope": "baseline", "on_miss": "fail"},
+            "tools": {},
+        }),
+        evaluators=[EvaluatorConfig(evaluator="your-evaluator", version=1)],
+    )
+)
+```
+
+Use `client.replays.get(replay.id)` to follow completion and obtain the result session. Fetch its inputs with `client.sessions.get()` and iterate nodes with `client.sessions.iter_nodes()` and `SessionNodeListParams(include_payloads=True)`.
+
+The native MCP server starts these replays through an experiment. Use `kitaru_cohorts_manage` to create a cohort and a version containing the baseline session, `kitaru_experiments_manage` to configure the same override, policy, and evaluator, then `kitaru_workflow_start` with `operation: "experiment_run"`, the experiment ID, cohort-version ID, and agent-version ID. No separate MCP replay-creation tool is required.
+
+Inspect the run with `kitaru_activity_read`: get `kind: "experiment_run"`, list `kind: "replay"` filtered by `experiment_run_id`, then get its result session. To read evidence, use `operation: "list_children"`, `kind: "session_nodes"`, `parent_id: "<result-session-id>"`, and `include_payloads: true`; follow the returned cursor until all pages have been read. A read-only MCP connection can inspect these results but cannot start experiments.
+
+### Files, skills, and processors
+
+Pass a static `inputProcessors` array in the factory configuration. File processors must use the factory's supplied `resolveFile`; declare every allowed URL in the adapter's `files` list and provide a baseline `resolveFile` that returns `{ bytes: Uint8Array, mediaType: string }`. Kitaru records those bytes and serves them from the recorded input during replay. An undeclared URL fails instead of fetching live content.
+
+For skills, set `skillsDirectory` to the directory containing your skill folders and use the factory's supplied `workspace`. Kitaru reads skill files into an immutable native workspace and records their paths, sizes, and hashes. Deploy the same skill artifact with the replay command. Changed files, missing files, and symlinks are rejected before execution.
+
+The factory must use the supplied memory and workspace instances. Processors and tools are application code: their dependencies must use these supplied bindings for replay isolation. Kitaru does not sandbox arbitrary callbacks or prevent code from opening another database connection or making a network request. Workflows, subagents, provider-executed tools, approval/resume modes, dynamic tool inventories, `prepareStep`, output processors, and secondary structured-output models remain unsupported.
+
+### Tool policies and evidence
+
+Native memory tools execute against the isolated replay store, including under `history` with `on_miss: "fail"`. External tools, including tools added by a processor, follow the replay tool policy. A tool named `updateWorkingMemory` does not acquire the native-memory exemption by name. Use history with a failing miss when external tools must not execute.
+
+Session inputs contain a version-2 `mastra_memory_replay` envelope with the raw invocation, initial thread/resource/messages, observational state and buffers, effective configuration, approved request context, and controlled file bytes. Dates, URLs, and binary values retain their types. Set `captureRequestContext` to select the context the run needs; never include credentials. Unsupported values, redaction, or exceeding the 1,048,576-character serialized payload bound make the input incomplete. Older history-only snapshots cannot recover this state and must be recorded again with the factory.
+
+Unlike ordinary wrapper recording, this path records the effective actor prompt, tools, tool choice, and supported settings for each provider attempt, including failed retries. Request attributes include attempt identity, memory revision, source provenance, and evidence completeness. `memory_mutation` span nodes record ordered native storage changes and link them to the active actor attempt when one exists. This evidence describes the request sent at the adapter's model boundary, not a provider's internal processing.
+
+Consume the stream through completion so Kitaru can join native background memory work, flush evidence, release source access, and close the isolated replay store. Inspect the replay session's status and evidence completeness as well as native output: recording problems do not replace application output, and Mastra can settle a stream after a policy failure. Missing or incomplete initial state fails replay before model execution. A failed or incomplete recording is not proof that all evidence was saved.
+
 ## Callback composition
 
 Per-run Mastra hooks replace configured hooks. During replay, Kitaru evaluates its policy first. Passthrough calls then invoke an explicitly supplied configured hook followed by the caller's per-run hook. Kitaru-mocked calls do not invoke user tool hooks. Step recording completes before configured and caller `onStepFinish` callbacks.
@@ -155,7 +293,7 @@ Mastra merges per-run model settings with configured defaults. Kitaru can replac
 
 Recorded payloads preserve JSON values, convert dates to ISO strings, bigints to decimal strings, and errors to `{name, message}`. Functions, symbols, circular references, and non-finite numbers are replaced with a marker instead of failing the run, because a recording problem must not break the agent. Replay tool inputs go through the same bounded converter that records them, so a history cache key computed during replay matches the key the server computed from the recorded call. Serialization never changes the Mastra result or tool output returned to the application.
 
-## Current scope
+## Existing wrapper scope
 
 This experimental release supports `Agent.generate()` with Mastra `>=1.51.0 <1.68.0` and consumed `Agent.stream()` calls, including replay, on stable Mastra 1.67.x. Streaming supports local function tools and schema-only structured output. It rejects user `prepareStep` and input processors, approval and resume modes, background or `untilIdle` execution, and secondary structured-output models before native execution. Both replay entrypoints reject `prepareStep` and input processors because they can replace the model, prompt, or tools after preflight. Workflows, subagents, MCP tools, provider-native tool replay, dynamic instructions, and LLM tool policy are intentionally not implemented.
 
