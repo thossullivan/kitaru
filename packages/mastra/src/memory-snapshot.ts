@@ -1,5 +1,10 @@
 import { createHash } from "node:crypto";
 import type { MastraDBMessage, StorageThreadType } from "@mastra/core/memory";
+import {
+  MASTRA_AUTH_TOKEN_KEY,
+  MASTRA_RESOURCE_ID_KEY,
+  MASTRA_THREAD_ID_KEY,
+} from "@mastra/core/request-context";
 import type {
   ObservationalMemoryRecord,
   StorageResourceType,
@@ -431,6 +436,18 @@ function validateConfiguration(
   configuration: unknown,
 ): asserts configuration is Record<string, unknown> {
   requireValue(isRecord(configuration), "Malformed resolved configuration.");
+  function containsTransport(value: unknown): boolean {
+    if (Array.isArray(value)) return value.some(containsTransport);
+    if (!isRecord(value)) return false;
+    return Object.entries(value).some(
+      ([key, item]) =>
+        /^(headers|abortsignal)$/i.test(key) || containsTransport(item),
+    );
+  }
+  requireValue(
+    !containsTransport(configuration),
+    "Replay configuration contains transport metadata.",
+  );
   const memory = configuration.memoryConfig ?? configuration.memory;
   if (!isRecord(memory)) return;
   requireValue(
@@ -444,6 +461,38 @@ function validateConfiguration(
         feature.scope === "thread",
         "Only explicitly thread-scoped memory is replayable.",
       );
+  }
+}
+
+/** Require native context selectors to match the leased and captured memory. */
+export function validateMemoryReplayContext(
+  selector: Pick<MastraMemorySnapshot, "threadId" | "resourceId">,
+  requestContext: Record<string, unknown>,
+): void {
+  requireValue(
+    !Object.hasOwn(requestContext, MASTRA_AUTH_TOKEN_KEY),
+    "Native authentication tokens are not replayable request context.",
+  );
+  validateMemoryReplaySelectors(selector, requestContext);
+}
+
+/** Validate selectors before a capture callback can omit middleware overrides. */
+export function validateMemoryReplaySelectors(
+  selector: Pick<MastraMemorySnapshot, "threadId" | "resourceId">,
+  requestContext: Record<string, unknown>,
+): void {
+  for (const [key, expected] of [
+    [MASTRA_THREAD_ID_KEY, selector.threadId],
+    [MASTRA_RESOURCE_ID_KEY, selector.resourceId],
+  ] as const) {
+    const value = requestContext[key];
+    requireValue(
+      value === undefined ||
+        value === null ||
+        value === "" ||
+        value === expected,
+      "Request-context memory selectors differ from the captured selectors.",
+    );
   }
 }
 
@@ -464,7 +513,6 @@ export function createMemoryReplayEnvelope(
   });
   try {
     validateMemorySnapshot(input.initialSnapshot);
-    validateConfiguration(input.configuration);
     const envelope: MastraMemoryReplayEnvelope = {
       version: 2,
       complete: true,
@@ -540,6 +588,17 @@ export function decodeMemoryReplayEnvelope(
   validateConfiguration(configuration);
   const requestContext = decodeMemoryValue(value.requestContext as JsonValue);
   requireValue(isRecord(requestContext), "Malformed recorded request context.");
+  validateMemoryReplayContext(initialSnapshot, requestContext);
+  if (isRecord(configuration.runOptions)) {
+    const memory = configuration.runOptions.memory;
+    requireValue(isRecord(memory), "Missing invocation memory selectors.");
+    const threadId = isRecord(memory.thread) ? memory.thread.id : memory.thread;
+    requireValue(
+      threadId === initialSnapshot.threadId &&
+        memory.resource === initialSnapshot.resourceId,
+      "Invocation memory selectors differ from the captured selectors.",
+    );
+  }
   const urls = new Set<string>();
   const files = value.files.map((file) => {
     requireValue(

@@ -38,6 +38,8 @@ import {
   type MastraMemorySnapshot,
   MEMORY_REPLAY_KEY,
   restoreMemoryReplayEnvelope,
+  validateMemoryReplayContext,
+  validateMemoryReplaySelectors,
 } from "./memory-snapshot.js";
 import { assertStableToolName } from "./replay-guards.js";
 import {
@@ -179,6 +181,26 @@ function assertSupportedConfiguration(
     );
 }
 
+class MemoryReplayRequestContext extends RequestContext {
+  constructor(
+    private readonly selector: Pick<
+      MastraMemorySnapshot,
+      "threadId" | "resourceId"
+    >,
+  ) {
+    super();
+  }
+
+  override set(key: string, value: unknown): void {
+    validateMemoryReplayContext(this.selector, { [key]: value });
+    super.set(key, value);
+  }
+
+  override setRaw(key: string, value: unknown): void {
+    this.set(key, value);
+  }
+}
+
 /** Construct each streamed invocation with historical configuration and isolated replay memory. */
 export function createMemoryReplayAgent(
   factory: MemoryReplayAgentFactory,
@@ -220,6 +242,25 @@ export function createMemoryReplayAgent(
       throw new Error(
         "Memory replay supports system_prompt overrides; replacing raw invocation input requires a new recording.",
       );
+    const selector = historical?.initialSnapshot ?? getSelector(callerOptions);
+    const liveContext = callerOptions.requestContext ?? new RequestContext();
+    if (!historical)
+      validateMemoryReplaySelectors(
+        selector,
+        Object.fromEntries(liveContext.entries()),
+      );
+    const recordedContext =
+      historical?.requestContext ??
+      options.captureRequestContext?.(liveContext) ??
+      Object.fromEntries(liveContext.entries());
+    const safeContext = requireRecord(
+      decodeMemoryValue(encodeMemoryValue(recordedContext)),
+      "request context",
+    );
+    validateMemoryReplayContext(selector, safeContext);
+    const requestContext = new MemoryReplayRequestContext(selector);
+    for (const [key, value] of Object.entries(safeContext))
+      requestContext.set(key, value);
     const abort = new AbortController();
     let state: AdapterRunState | undefined;
     let requestCapture: ReturnType<typeof createRequestCapture> | undefined;
@@ -281,7 +322,6 @@ export function createMemoryReplayAgent(
       });
     } else {
       const source = await options.sourceMemory();
-      const selector = getSelector(callerOptions);
       const binding = createMemoryCaptureBinding({
         invocationId,
         ...selector,
@@ -353,19 +393,6 @@ export function createMemoryReplayAgent(
         throw new Error(
           "Agent factory must use its supplied pinned workspace.",
         );
-      const liveContext = callerOptions.requestContext ?? new RequestContext();
-      const recordedContext =
-        historical?.requestContext ??
-        options.captureRequestContext?.(liveContext) ??
-        Object.fromEntries(liveContext.entries());
-      // Validate before any dynamic resolver can observe an unrecordable value.
-      const safeContext = requireRecord(
-        decodeMemoryValue(encodeMemoryValue(recordedContext)),
-        "request context",
-      );
-      const requestContext = new RequestContext();
-      for (const [key, value] of Object.entries(safeContext))
-        requestContext.set(key, value);
       const dynamic = { requestContext, mastra: options.mastra };
       const instructions = historical
         ? historical.configuration.instructions
@@ -394,6 +421,14 @@ export function createMemoryReplayAgent(
           ? await config.defaultOptions(dynamic)
           : (config.defaultOptions ?? {});
       const defaults = requireRecord(resolvedDefaults, "default options");
+      // Dynamic resolvers receive the mutable context that native Mastra uses.
+      const effectiveContext = requireRecord(
+        decodeMemoryValue(
+          encodeMemoryValue(Object.fromEntries(requestContext.entries())),
+        ),
+        "request context",
+      );
+      validateMemoryReplayContext(selector, effectiveContext);
       const { deepMerge } = await import("@mastra/core/utils");
       const callerData = { ...callerOptions };
       delete callerData.requestContext;
@@ -407,6 +442,14 @@ export function createMemoryReplayAgent(
           )
         : deepMerge(defaults, callerData);
       assertSupportedConfiguration(config, effective);
+      const effectiveSelector = getSelector(effective);
+      if (
+        effectiveSelector.threadId !== selector.threadId ||
+        effectiveSelector.resourceId !== selector.resourceId
+      )
+        throw new Error(
+          "Invocation memory selectors differ from the captured selectors.",
+        );
       if (record(effective.memory) && effective.memory.options !== undefined)
         throw new Error(
           "Per-call memory.options are unsupported. Set the complete memory configuration in sourceMemory instead.",
@@ -436,7 +479,7 @@ export function createMemoryReplayAgent(
         rawInput: invocationInput,
         initialSnapshot: runtime.initialSnapshot as MastraMemorySnapshot,
         configuration,
-        requestContext: safeContext,
+        requestContext: effectiveContext,
         files: files.files,
       });
       if (!envelope.complete && historical)
@@ -572,7 +615,25 @@ export function createMemoryReplayAgent(
         },
       });
     } catch (error) {
-      await runtime.finish();
+      try {
+        await runtime.finish();
+      } catch (cleanupError) {
+        if (options.onRecordingError) {
+          void Promise.resolve()
+            .then(() =>
+              options.onRecordingError?.({
+                error: cleanupError,
+                sessionId: state?.sessionId,
+                stage: "complete",
+              }),
+            )
+            .catch(() => undefined);
+        } else {
+          console.warn(
+            "Kitaru memory cleanup failed after the invocation failed",
+          );
+        }
+      }
       throw error;
     }
   }
