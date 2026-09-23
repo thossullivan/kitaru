@@ -619,3 +619,97 @@ it("releases the source lease on setup failure and cancellation", async () => {
   await release();
   await runtime.store.close();
 });
+
+it("stops later actor and tool work after native memory storage fails", async () => {
+  const runtime = createMemoryRuntime({ messageTokens: 10000 });
+  await seedMemory(runtime);
+  const api = installTestApi();
+  const lease = createProcessLocalMemoryAccess();
+  const { createTool } = await import("@mastra/core/tools");
+  const { z } = await import("zod/v4");
+  const external = vi.fn(async () => "side effect");
+  let actorCalls = 0;
+  const patchThread = runtime.domain.patchThread.bind(runtime.domain);
+  vi.spyOn(runtime.domain, "patchThread").mockImplementation(
+    async (...args) => {
+      if (actorCalls > 0) throw new Error("Native memory write failed");
+      return patchThread(...args);
+    },
+  );
+  const model = new MastraLanguageModelV2Mock({
+    modelId: "actor",
+    provider: "fixture",
+    doStream: async () =>
+      ++actorCalls === 1
+        ? streamParts(
+            [
+              {
+                type: "tool-call",
+                toolName: "updateWorkingMemory",
+                toolCallId: "memory-failure",
+                input: JSON.stringify({ memory: { preference: "green" } }),
+              },
+              {
+                type: "tool-call",
+                toolName: "external",
+                toolCallId: "later-tool",
+                input: "{}",
+              },
+            ],
+            "tool-calls",
+          )
+        : textStream("incorrect continuation"),
+  });
+  const adapter = createMemoryReplayAgent(
+    ({ memory }) => ({
+      id: "write-failure",
+      name: "Write failure",
+      instructions: "Update memory",
+      model,
+      memory,
+      defaultOptions: { maxSteps: 3, toolCallConcurrency: 1 },
+      tools: {
+        external: createTool({
+          id: "external",
+          description: "A side effect",
+          inputSchema: z.object({}),
+          execute: external,
+        }),
+      },
+    }),
+    {
+      agentId: AGENT_ID,
+      apiUrl: "https://kitaru.invalid",
+      requestedModelId: "fixture/actor",
+      sourceMemory: () => ({
+        settled: () => runtime.memory.settled(),
+        domain: runtime.domain,
+        configuration: runtime.memory.getMergedThreadConfig(),
+        exclusiveAccess: lease,
+      }),
+      resolveModel: () => model,
+    },
+  );
+  try {
+    const output = await adapter.stream("Remember green", {
+      memory: { thread: THREAD, resource: RESOURCE },
+    });
+    await output.consumeStream();
+    await vi.waitFor(() =>
+      expect(
+        api.calls.filter((call) => call.method === "PATCH").at(-1)?.body
+          ?.status,
+      ).toBe("failed"),
+    );
+    expect(actorCalls).toBe(1);
+    expect(external).not.toHaveBeenCalled();
+    const release = await lease.acquire({
+      threadId: THREAD,
+      resourceId: RESOURCE,
+    });
+    await release();
+  } finally {
+    await runtime.memory.settled();
+    await runtime.store.close();
+  }
+});

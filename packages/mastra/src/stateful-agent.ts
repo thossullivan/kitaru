@@ -227,6 +227,14 @@ export function createMemoryReplayAgent(
       if (!state) throw new Error("Memory recorder has not initialized.");
       return state;
     };
+    const onIncomplete = (reason: string): void => {
+      // Mastra converts tool storage errors into results and otherwise continues.
+      // Recording-only incompleteness must preserve ordinary native execution.
+      if (reason !== "Native memory storage mutation failed.") return;
+      const error = new Error(reason);
+      state?.storeFailure(error);
+      abort.abort(error);
+    };
     const writeNode = async (node: SessionNodeCreateRequest) => {
       const active = getState();
       await active.enqueueStep(async () => {
@@ -268,6 +276,7 @@ export function createMemoryReplayAgent(
         ),
         resolveModel: options.resolveModel,
         recordMutation,
+        onIncomplete,
         getRequestId: () => requestCapture?.currentRequestId,
       });
     } else {
@@ -279,6 +288,7 @@ export function createMemoryReplayAgent(
         domain: source.domain,
         exclusiveAccess: source.exclusiveAccess,
         recordMutation,
+        onIncomplete,
         getRequestId: () => requestCapture?.currentRequestId,
       });
       const { Memory } = await import("@mastra/memory");
