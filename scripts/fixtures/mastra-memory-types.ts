@@ -5,7 +5,7 @@ import {
   createMemoryReplayAgent,
   createProcessLocalMemoryAccess,
   type MemoryReplayAgentOptions,
-} from "@zenml-io/kitaru-mastra";
+} from "@zenml-io/kitaru-mastra/memory";
 import { z } from "zod";
 
 const store = new InMemoryStore();

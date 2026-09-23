@@ -7,7 +7,7 @@ import { pathToFileURL } from "node:url";
 import {
   createMemoryReplayAgent,
   createProcessLocalMemoryAccess,
-} from "../packages/mastra/dist/index.js";
+} from "../packages/mastra/dist/memory.js";
 
 const require = createRequire(
   new URL("../packages/mastra/package.json", import.meta.url),

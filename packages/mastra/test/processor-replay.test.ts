@@ -10,7 +10,7 @@ import {
   createMemoryReplayAgent,
   createProcessLocalMemoryAccess,
   MEMORY_REPLAY_KEY,
-} from "../src/index.js";
+} from "../src/memory.js";
 import {
   createMemoryRuntime,
   FILE_URL,

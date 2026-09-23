@@ -183,7 +183,7 @@ A missing, incomplete, or lossy snapshot produces an actionable unsupported-repl
 
 ## Isolated memory replay
 
-Use `createMemoryReplayAgent()` when a consumed stream needs thread-scoped schema working memory, observational memory, or controlled input processors. This opt-in factory requires exactly `@mastra/core@1.67.0` and `@mastra/memory@1.30.0`. The existing `KitaruAgent` wrapper keeps its history-only memory behavior.
+Import `createMemoryReplayAgent()` from `@zenml-io/kitaru-mastra/memory` when a consumed stream needs thread-scoped schema working memory, observational memory, or controlled input processors. This opt-in factory requires exactly `@mastra/core@1.67.0` and `@mastra/memory@1.30.0`. The existing `KitaruAgent` wrapper stays at the package root, keeps its history-only memory behavior, and does not require `@mastra/memory`.
 
 ```bash
 pnpm add @zenml-io/kitaru-mastra @mastra/core@1.67.0 @mastra/memory@1.30.0 zod
@@ -199,7 +199,7 @@ import { Memory } from "@mastra/memory";
 import {
   createMemoryReplayAgent,
   createProcessLocalMemoryAccess,
-} from "@zenml-io/kitaru-mastra";
+} from "@zenml-io/kitaru-mastra/memory";
 import { z } from "zod";
 
 const store = new InMemoryStore();
@@ -252,6 +252,8 @@ await store.close();
 Run this entrypoint with `KITARU_API_URL`, a Kitaru credential, an existing `KITARU_AGENT_ID`, and the model provider credential. Register the compiled command as the agent version's run specification to run it through a worker. The same command serves baseline and replay tasks; the worker supplies the recorded input and replay identity.
 
 All source-memory writers must participate in the same exclusive-access mechanism. The process-local helper is suitable only when every writer shares that instance in one process. Use a distributed implementation of `MastraExclusiveMemoryAccess` when other processes can write. Its `acquire()` method must hold access until the returned release function runs. `settled()` must join pending work on the source `Memory` instance; it is not a lock. Configure working and observational memory with `scope: "thread"`; resource-scoped state, semantic recall, automatic title generation, and per-call `memory.options` are outside this contract.
+
+Keep `memory.thread` and `memory.resource` equal to any reserved Mastra thread/resource IDs in `requestContext`; a mismatch is rejected before native execution. Use `captureRequestContext` to select safe values: native authentication tokens are rejected, and transport headers in recorded configuration make the replay envelope incomplete. Use `resolveModel` to reconstruct credential-bearing model instances for replay.
 
 Dynamic `instructions`, `model`, and `defaultOptions` resolve once during baseline setup. Replay uses their recorded values instead of calling those resolvers again. `resolveModel` must resolve the recorded actor, observer, and reflector model identifiers as well as any allowed actor override. A `system_prompt` override replaces only application instructions and retains recorded extra system context. Model and model-setting overrides affect the actor; observation and reflection retain their recorded configuration. Raw-input `prompt` overrides are rejected; record a new baseline to change invocation input.
 

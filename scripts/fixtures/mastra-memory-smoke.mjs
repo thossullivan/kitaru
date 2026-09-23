@@ -4,7 +4,7 @@ import { Memory } from "@mastra/memory";
 import {
   createMemoryReplayAgent,
   createProcessLocalMemoryAccess,
-} from "@zenml-io/kitaru-mastra";
+} from "@zenml-io/kitaru-mastra/memory";
 import { z } from "zod";
 
 const calls = [];
