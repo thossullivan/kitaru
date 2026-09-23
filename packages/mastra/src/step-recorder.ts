@@ -10,7 +10,10 @@ import {
   recordNormalizedStep,
   resolveCost,
 } from "@zenml-io/kitaru/adapter";
-
+import {
+  type RequestEvidence,
+  requestEvidenceAttributes,
+} from "./request-capture.js";
 import type { KitaruCostCalculator, PublicModelIdentity } from "./types.js";
 
 export type RecordedStep = LLMStepResult<unknown> & {
@@ -174,6 +177,7 @@ export async function recordStep(
   step: RecordedStep,
   costCalculator?: KitaruCostCalculator,
   limits?: RecordingLimits,
+  requestEvidence?: RequestEvidence,
 ): Promise<void> {
   const calls = step.toolCalls.flatMap((item) => {
     const call = toolCallPayload(item);
@@ -224,11 +228,13 @@ export async function recordStep(
     };
   });
   const failed = step.finishReason === "error" || step.tripwire !== undefined;
-  const servedModelId = step.response?.modelId ?? step.model?.modelId;
+  const servedModelId =
+    step.response?.modelId ?? step.model?.modelId ?? requestEvidence?.modelId;
+  const provider = step.model?.provider ?? requestEvidence?.provider;
   const tokens = usageTokens(step.usage);
   const cost = await resolveCost(costCalculator, {
     model: servedModelId ?? "",
-    provider: step.model?.provider ?? "",
+    provider: provider ?? "",
     requestedModelId: state.requestedModelId,
     tokens,
   });
@@ -236,6 +242,7 @@ export async function recordStep(
   await recordNormalizedStep(state, {
     attributes: {
       cost: cost.attribute,
+      ...(requestEvidence ? requestEvidenceAttributes(requestEvidence) : {}),
       ...(isRecord(step.providerMetadata)
         ? { provider_metadata: projectRecordedMetadata(step.providerMetadata) }
         : {}),
@@ -244,12 +251,14 @@ export async function recordStep(
     error: failed
       ? errorMessage(step.error ?? step.tripwire?.reason, "Model step failed")
       : undefined,
-    externalId: step.response?.id,
+    externalId: requestEvidence?.externalId ?? step.response?.id,
     failed,
-    inputs: null,
+    inputs: requestEvidence?.inputs ?? null,
     model: servedModelId,
+    modelSettings: requestEvidence?.modelSettings,
+    startedAt: requestEvidence?.startedAt,
     outputs: stepOutputs(step, tools),
-    provider: step.model?.provider,
+    provider,
     tokens,
     tools,
   });
