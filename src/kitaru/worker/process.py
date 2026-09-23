@@ -18,13 +18,16 @@ import contextlib
 import logging
 import os
 import re
+import subprocess
 import sys
 import tomllib
 import uuid
+from functools import cache
 from pathlib import Path
 from typing import Any, NamedTuple
 
 from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
 
 from kitaru.worker.platforms import WorkerPlatform, current_platform
 
@@ -66,6 +69,52 @@ _PEP723_BLOCK_REGEX = (
 
 # Extra an importer package declares for its API import dependencies.
 API_EXTRA = "api"
+
+# Published first-party distributions. Keep this list in sync with the PyPI
+# units in release/release-units.toml; the worker cannot read that source file.
+_FIRST_PARTY_KITARU_PACKAGES = frozenset(
+    {
+        "kitaru-braintrust-importer",
+        "kitaru-claude-agent-sdk",
+        "kitaru-evaluator",
+        "kitaru-jsonl-importer",
+        "kitaru-langfuse-importer",
+        "kitaru-langgraph",
+        "kitaru-langsmith-importer",
+        "kitaru-logfire-importer",
+        "kitaru-mastra-importer",
+        "kitaru-openai-agents",
+        "kitaru-phoenix-importer",
+        "kitaru-post-import-insights",
+        "kitaru-pydantic-ai",
+        "kitaru-typesafe-evaluator",
+    }
+)
+
+
+@cache
+def _uv_supports_package_age_exceptions() -> bool:
+    """Check whether uv accepts package-specific exclude-newer overrides."""
+    try:
+        result = subprocess.run(
+            ["uv", "run", "--help"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        supported = (
+            result.returncode == 0 and "--exclude-newer-package" in result.stdout
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        supported = False
+    if not supported:
+        logger.warning(
+            "Installed uv does not support --exclude-newer-package; upgrade uv "
+            "to 0.8.4 or newer to resolve newly published Kitaru packages "
+            "under an exclude-newer cutoff"
+        )
+    return supported
 
 
 class TaskProcess(NamedTuple):
@@ -373,7 +422,28 @@ def get_python_run_argv(
         sys.executable,
         "--prerelease=allow",
     ]
+    # The worker may run inside a checkout whose exclude-newer cutoff predates
+    # a pinned Kitaru plugin and the core release required by that plugin.
+    allows_fresh_kitaru = False
+    supports_package_age_exceptions: bool | None = None
     for dependency in dependencies:
+        requirement = Requirement(dependency)
+        package = canonicalize_name(requirement.name)
+        specifiers = list(requirement.specifier)
+        if (
+            (package == "kitaru" or package in _FIRST_PARTY_KITARU_PACKAGES)
+            and len(specifiers) == 1
+            and specifiers[0].operator == "=="
+            and "*" not in specifiers[0].version
+        ):
+            if supports_package_age_exceptions is None:
+                supports_package_age_exceptions = _uv_supports_package_age_exceptions()
+            if supports_package_age_exceptions:
+                if not allows_fresh_kitaru:
+                    parts.extend(["--exclude-newer-package", "kitaru=0 days"])
+                    allows_fresh_kitaru = True
+                if package != "kitaru":
+                    parts.extend(["--exclude-newer-package", f"{package}=0 days"])
         parts.extend(["--with", dependency])
     parts.extend(["python", "-m", module, *args])
     return parts

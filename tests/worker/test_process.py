@@ -14,13 +14,17 @@
 """Tests for subprocess supervision and process/environment building."""
 
 import asyncio
+import logging
+import subprocess
 import sys
 import time
+import tomllib
 import uuid
 from pathlib import Path
 
 import pytest
 
+from kitaru.worker import process as process_module
 from kitaru.worker.process import (
     TailBuffer,
     TaskProcess,
@@ -331,3 +335,107 @@ def test_get_python_run_argv_with_dependencies() -> None:
         "kitaru.task",
         "import",
     ]
+
+
+def test_get_python_run_argv_allows_fresh_pinned_kitaru_plugins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """New Kitaru releases can resolve under the worker's project cutoff."""
+    monkeypatch.setattr(
+        process_module, "_uv_supports_package_age_exceptions", lambda: True
+    )
+    argv = get_python_run_argv(
+        "kitaru.task",
+        ["import"],
+        ["kitaru-langfuse-importer[api]==0.4.0", "requests==2.32.5"],
+    )
+    assert argv == [
+        "uv",
+        "run",
+        "--no-project",
+        "--python",
+        sys.executable,
+        "--prerelease=allow",
+        "--exclude-newer-package",
+        "kitaru=0 days",
+        "--exclude-newer-package",
+        "kitaru-langfuse-importer=0 days",
+        "--with",
+        "kitaru-langfuse-importer[api]==0.4.0",
+        "--with",
+        "requests==2.32.5",
+        "python",
+        "-m",
+        "kitaru.task",
+        "import",
+    ]
+
+
+def test_get_python_run_argv_allows_all_released_kitaru_packages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every published first-party plugin can bypass a stale project cutoff."""
+    monkeypatch.setattr(
+        process_module, "_uv_supports_package_age_exceptions", lambda: True
+    )
+    inventory = Path(__file__).resolve().parents[2] / "release/release-units.toml"
+    units = tomllib.loads(inventory.read_text())["units"]
+    for unit in units:
+        package = unit["distribution"]
+        if unit["registry"] != "pypi" or not package.startswith("kitaru-"):
+            continue
+        argv = get_python_run_argv("kitaru.task", ["evaluate"], [f"{package}==1.0.0"])
+        assert f"{package}=0 days" in argv, package
+
+
+def test_get_python_run_argv_keeps_legacy_uv_compatible(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Older uv versions use the prior argv and warn once about the cutoff."""
+    calls: list[list[str]] = []
+
+    def old_uv_help(
+        command: list[str], **_: object
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, "--exclude-newer", "")
+
+    monkeypatch.setattr(process_module.subprocess, "run", old_uv_help)
+    process_module._uv_supports_package_age_exceptions.cache_clear()
+    try:
+        with caplog.at_level(logging.WARNING, logger=process_module.__name__):
+            for _ in range(2):
+                argv = get_python_run_argv(
+                    "kitaru.task", ["import"], ["kitaru-langfuse-importer[api]==0.4.0"]
+                )
+                assert argv == [
+                    "uv",
+                    "run",
+                    "--no-project",
+                    "--python",
+                    sys.executable,
+                    "--prerelease=allow",
+                    "--with",
+                    "kitaru-langfuse-importer[api]==0.4.0",
+                    "python",
+                    "-m",
+                    "kitaru.task",
+                    "import",
+                ]
+    finally:
+        process_module._uv_supports_package_age_exceptions.cache_clear()
+    assert calls == [["uv", "run", "--help"]]
+    assert (
+        len([record for record in caplog.records if "upgrade uv" in record.message])
+        == 1
+    )
+
+
+@pytest.mark.parametrize("dependency", ["kitaru-custom==1.0.0", "kitaru-custom>=1"])
+def test_get_python_run_argv_keeps_custom_plugins_under_cutoff(
+    dependency: str,
+) -> None:
+    """A custom plugin cannot bypass the worker's package-age cutoff."""
+    argv = get_python_run_argv("kitaru.task", ["import"], [dependency])
+    assert "kitaru-custom=0 days" not in argv
+    assert "--exclude-newer-package" not in argv
