@@ -248,10 +248,12 @@ replay = await client.replays.create(
     ReplayCreateRequest(
         baseline_session_id=baseline_id,
         override=ReplayOverride(system_prompt="Use the recorded preferences."),
-        tool_policy=ToolPolicy.model_validate({
-            "default": {"type": "history", "scope": "baseline", "on_miss": "fail"},
-            "tools": {},
-        }),
+        tool_policy=ToolPolicy.model_validate(
+            {
+                "default": {"type": "history", "scope": "baseline", "on_miss": "fail"},
+                "tools": {},
+            }
+        ),
         evaluators=[EvaluatorConfig(evaluator="your-evaluator", version=1)],
     )
 )
