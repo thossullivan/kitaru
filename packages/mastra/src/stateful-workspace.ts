@@ -1,11 +1,7 @@
 import { createHash } from "node:crypto";
 import { lstat, readdir, readFile } from "node:fs/promises";
 import { join, posix } from "node:path";
-import {
-  type SkillSource,
-  type SkillSourceEntry,
-  Workspace,
-} from "@mastra/core/workspace";
+import type { SkillSource, SkillSourceEntry } from "@mastra/core/workspace";
 import { MAX_RECORDED_PAYLOAD_CHARS } from "@zenml-io/kitaru/adapter";
 
 export interface SkillsManifest {
@@ -17,6 +13,7 @@ export async function loadSkillsWorkspace(
   skillsDirectory: string,
   expectedManifest?: SkillsManifest,
 ) {
+  const { Workspace } = await import("@mastra/core/workspace");
   const files = new Map<string, Buffer>();
   const directories = new Map<string, SkillSourceEntry[]>();
   let size = 0;

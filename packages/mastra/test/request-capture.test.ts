@@ -101,6 +101,7 @@ it.each(["v2", "v3", "v4"])(
 
 it("captures retries after late prompt and settings changes without changing the provider arguments", async () => {
   const received: ModelCall[] = [];
+  const requestIds: (string | undefined)[] = [];
   const failed = vi.fn();
   const capture = createRequestCapture({
     invocationId: "retry",
@@ -112,6 +113,7 @@ it("captures retries after late prompt and settings changes without changing the
     provider: "fixture",
     doStream: async (args) => {
       received.push(args);
+      requestIds.push(capture.currentRequestId);
       if (received.length === 1)
         throw new APICallError({
           message: "Retry",
@@ -143,6 +145,9 @@ it("captures retries after late prompt and settings changes without changing the
   });
   const output = await agent.stream("question");
   await output.consumeStream();
+  expect(requestIds).toHaveLength(2);
+  expect(typeof requestIds[0]).toBe("string");
+  expect(requestIds[0]).not.toBe(requestIds[1]);
   expect(await output.text).toBe("done");
   await capture.drain();
   expect(failed).toHaveBeenCalledTimes(1);
@@ -151,6 +156,7 @@ it("captures retries after late prompt and settings changes without changing the
   expect(first.externalId).not.toBe(second.externalId);
   expect([first.attemptNumber, second.attemptNumber]).toEqual([1, 2]);
   for (const [index, evidence] of [first, second].entries()) {
+    expect(requestIds[index]).toBe(evidence.externalId);
     expect(decodeMemoryValue(evidence.inputs)).toEqual({
       prompt: required(received[index]).prompt,
       tools: required(received[index]).tools,

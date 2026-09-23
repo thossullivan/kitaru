@@ -70,6 +70,7 @@ function asRecord(value: unknown): Record<string, unknown> {
 
 /** Capture the final provider arguments without consuming or replacing its output stream. */
 export function createRequestCapture(options: RequestCaptureOptions) {
+  let currentRequestId: string | undefined;
   let context: {
     stepNumber: number;
     provenance: JsonValue;
@@ -243,6 +244,7 @@ export function createRequestCapture(options: RequestCaptureOptions) {
         ) {
           return async (...args: unknown[]) => {
             const evidence = capture(target, key, args[0]);
+            currentRequestId = evidence.externalId;
             const attempt = { evidence, returned: false };
             unfinished.set(evidence.externalId, attempt);
             try {
@@ -295,7 +297,16 @@ export function createRequestCapture(options: RequestCaptureOptions) {
     while (writes.size > 0) await Promise.all(writes);
   }
 
-  return { beginStep, instrumentModel, takeSuccessful, flushUnfinished, drain };
+  return {
+    beginStep,
+    instrumentModel,
+    takeSuccessful,
+    flushUnfinished,
+    drain,
+    get currentRequestId() {
+      return currentRequestId;
+    },
+  };
 }
 
 /** Attributes shared by normal step completion and failed or unfinished attempt records. */

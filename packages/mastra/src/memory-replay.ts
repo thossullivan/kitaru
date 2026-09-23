@@ -2,11 +2,6 @@ import { createRequire } from "node:module";
 import type { MastraModelConfig } from "@mastra/core/llm";
 import type { MemoryConfigInternal } from "@mastra/core/memory";
 import {
-  standardSchemaToJSONSchema,
-  toStandardSchema,
-} from "@mastra/core/schema";
-import { InMemoryStore, MastraCompositeStore } from "@mastra/core/storage";
-import {
   createMemoryCaptureBinding,
   createProcessLocalMemoryAccess,
   type MastraMemoryCaptureOptions,
@@ -86,6 +81,9 @@ export function serializeMemoryConfiguration(
   checkConfiguration(config);
   const copy: Record<string, unknown> = { ...config };
   if (config.workingMemory?.schema) {
+    const { standardSchemaToJSONSchema, toStandardSchema } = createRequire(
+      import.meta.url,
+    )("@mastra/core/schema") as typeof import("@mastra/core/schema");
     copy.workingMemory = {
       ...config.workingMemory,
       schema: standardSchemaToJSONSchema(
@@ -159,6 +157,9 @@ export async function createIsolatedMemoryReplay(
     options.resolveModel,
   );
   const { Memory } = await import("@mastra/memory");
+  const { InMemoryStore, MastraCompositeStore } = await import(
+    "@mastra/core/storage"
+  );
   const store = new InMemoryStore();
   const domain = store.stores.memory;
   if (!domain) return unsupported("Native in-memory storage is unavailable.");
