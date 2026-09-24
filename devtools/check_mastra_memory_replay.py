@@ -56,6 +56,7 @@ from kitaru.api_models.v1.session import (
 from kitaru.api_models.v1.session_node import SessionNodeListParams
 from kitaru.api_models.v1.session_run import SessionRunCreateRequest
 from kitaru.client.api_client import KitaruAPIClient
+from kitaru.client.exceptions import APIError
 from kitaru.worker import Worker, WorkerConfig
 
 ARTIFACT = Path(__file__).with_suffix(".mjs").resolve()
@@ -446,7 +447,7 @@ async def check(output: Path) -> None:
                                 },
                                 {
                                     "type": "file",
-                                    "data": "https://files.invalid/historical.pdf",
+                                    "data": "https://files.invalid/historical.pdf?token=historical-secret",
                                     "mimeType": "application/pdf",
                                 },
                             ],
@@ -462,9 +463,30 @@ async def check(output: Path) -> None:
                 )
             sessions = [session async for session in client.sessions.iter()]
             assert len(sessions) == 1
-            baseline = await client.sessions.get(sessions[0].id)
-            assert baseline.inputs["mastra_memory_replay"]["complete"] is True
-            assert len(json.dumps(baseline.inputs).encode()) > 32768
+            deadline = asyncio.get_running_loop().time() + 30
+            while True:
+                baseline = await client.sessions.get(sessions[0].id)
+                if baseline.metadata.get("mastra_replay_state") != "pending":
+                    break
+                assert asyncio.get_running_loop().time() < deadline, (
+                    "Baseline memory evidence did not finalize"
+                )
+                await asyncio.sleep(0.2)
+            assert baseline.metadata["mastra_replay_state"] == "eligible"
+            envelope = baseline.inputs["mastra_memory_replay"]
+            assert envelope["complete"] is True
+            assert len(envelope["initialSnapshot"]["messages"]) == 830
+            assert envelope["initialSnapshot"]["records"]
+            first_message = next(
+                message
+                for message in envelope["initialSnapshot"]["messages"]
+                if message["id"] == "historical-0"
+            )
+            hotels = first_message["content"]["metadata"]["hotels"]
+            assert len(hotels) == 1500
+            assert all(len(hotel["details"]) == 10 for hotel in hotels)
+            assert len(json.dumps(baseline.inputs).encode()) > 1_048_576
+            assert "historical-secret" not in json.dumps(baseline.inputs)
             connection = await asyncpg.connect(
                 host=DB_HOST,
                 port=DB_PORT,
@@ -551,34 +573,26 @@ async def check(output: Path) -> None:
                 SessionCreateRequest(
                     agent_id=agent.id,
                     agent_version_id=version.id,
+                    framework="mastra",
                     origin=SessionOrigin.RECORDED,
                     status=SessionStatus.COMPLETED,
                     inputs=incomplete,
                     outputs={"text": "incomplete fixture"},
                 )
             )
-            failed = await client.replays.create(
-                ReplayCreateRequest(
-                    baseline_session_id=broken.id,
-                    evaluators=[config],
-                    override=ReplayOverride(**OVERRIDE),
+            try:
+                await client.replays.create(
+                    ReplayCreateRequest(
+                        baseline_session_id=broken.id,
+                        evaluators=[config],
+                        override=ReplayOverride(**OVERRIDE),
+                    )
                 )
-            )
-            assert failed.job_id
-            failed_job = await await_job(
-                client, failed.job_id, "incomplete replay", 120
-            )
-            assert failed_job.status == JobStatus.FAILED, failed_job
-            failed_tasks = await client.jobs.list_tasks(failed_job.id)
-            assert any(
-                "incomplete" in (task.error or "").lower()
-                for task in failed_tasks.items
-            )
-            failed = await client.replays.get(failed.id)
-            assert failed.status == "failed"
-            assert failed.result_session_id is None
-            failure_cli = await run_cli("replay", "get", str(failed.id))
-            assert failure_cli["item"]["status"] == "failed"
+            except APIError as error:
+                assert error.status_code == 409
+                assert "mastra_replay_incomplete" in error.detail
+            else:
+                raise AssertionError("Incomplete replay was scheduled")
             reports = [
                 json.loads(path.read_text())
                 for path in directory.glob("*.json")
@@ -586,10 +600,9 @@ async def check(output: Path) -> None:
             ]
             good = [report for report in reports if report.get("result") == "passed"]
             assert len(good) == 4, reports
-            rejected = [
+            assert not [
                 report for report in reports if report.get("result") == "failed"
             ]
-            assert rejected and all(report["actor_calls"] == 0 for report in rejected)
             assert all(report["unrelated_blob_status"] == 403 for report in good)
             assert all(
                 not report["task_inputs_in_environment"]
@@ -628,7 +641,7 @@ async def check(output: Path) -> None:
                 "sdk": sdk,
                 "cli": cli,
                 "mcp": mcp_result,
-                "incomplete_replay_id": str(failed.id),
+                "incomplete_baseline_id": str(broken.id),
                 "read_only_mutation_denied": True,
                 "task_reports": reports,
                 "provider_calls": 0,

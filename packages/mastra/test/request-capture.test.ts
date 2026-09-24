@@ -173,6 +173,7 @@ it("uses public tags and message sources for provenance", () => {
   messageList.addSystem("remembered", "memory");
   messageList.add([{ role: "user", content: "old" }], "memory");
   messageList.add([{ role: "user", content: "extra" }], "context");
+  const serialize = vi.spyOn(messageList, "serializeForSpan");
   const capture = createRequestCapture({
     invocationId: "sources",
     getMemoryRevision: () => 0,
@@ -190,7 +191,40 @@ it("uses public tags and message sources for provenance", () => {
       systemMessages: [{ tag: "application" }, { tag: "memory" }],
       messages: [{ source: "memory" }, { source: "context" }],
     });
+    expect(JSON.stringify(evidence.provenance)).not.toContain(
+      '"content":"old"',
+    );
+    expect(JSON.stringify(evidence.provenance)).not.toContain(
+      '"content":"extra"',
+    );
+    expect(serialize).not.toHaveBeenCalled();
   });
+});
+
+it("keeps a 500 KiB actor request complete without copying its text into provenance", async () => {
+  const capture = createRequestCapture({
+    invocationId: "large-request",
+    getMemoryRevision: () => 0,
+  });
+  const list = new MessageList();
+  const content = "x".repeat(500 * 1024);
+  list.add([{ role: "user", content }], "memory");
+  capture.beginStep({
+    stepNumber: 0,
+    messageList: list,
+    extraContext: { context: content },
+  });
+  const model = capture.instrumentModel({
+    specificationVersion: "v2",
+    modelId: "actor",
+    provider: "fixture",
+    doGenerate: async (_args: unknown) => "native",
+  });
+  await model.doGenerate({ prompt: [{ role: "user", content }] });
+  const evidence = required(capture.takeSuccessful());
+  expect(evidence.complete).toBe(true);
+  expect(JSON.stringify(evidence.inputs)).toContain(content);
+  expect(JSON.stringify(evidence.provenance).length).toBeLessThan(1_000);
 });
 
 it("contains capture and telemetry failures while preserving native errors", async () => {

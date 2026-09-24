@@ -1,5 +1,9 @@
 import { Agent } from "@mastra/core/agent";
 import type { InputProcessor } from "@mastra/core/processors";
+import {
+  MASTRA_AUTH_TOKEN_KEY,
+  RequestContext,
+} from "@mastra/core/request-context";
 import { MastraLanguageModelV2Mock } from "@mastra/core/test-utils/llm-mock";
 import { afterEach, expect, it, vi } from "vitest";
 import {
@@ -97,6 +101,128 @@ it("retains invocation memory tool identity through public native conversion", a
     }),
   ).toContain("green");
   await runtime.store.close();
+});
+
+it("executes a second-step memory tool during replay", async () => {
+  const runtime = createMemoryRuntime({ messageTokens: 10000 });
+  await seedMemory(runtime);
+  const { createTool } = await import("@mastra/core/tools");
+  const { z } = await import("zod/v4");
+  const access = createProcessLocalMemoryAccess();
+  const api = installTestApi({
+    replaySpec: {
+      id: REPLAY_ID,
+      baseline_session_id: ORIGINAL_SESSION_ID,
+      status: "pending",
+      override: null,
+      tool_policy: {
+        default: { type: "history", scope: "baseline", on_miss: "fail" },
+        tools: { advance: { type: "passthrough" } },
+      },
+    },
+  });
+  const advance = vi.fn(async () => ({ next: true }));
+  let calls = 0;
+  const model = new MastraLanguageModelV2Mock({
+    modelId: "actor",
+    provider: "fixture",
+    doStream: async () => {
+      const step = ++calls % 3;
+      if (step === 1)
+        return streamParts(
+          [
+            {
+              type: "tool-call",
+              toolCallId: `advance-${calls}`,
+              toolName: "advance",
+              input: "{}",
+            },
+          ],
+          "tool-calls",
+        );
+      if (step === 2)
+        return streamParts(
+          [
+            {
+              type: "tool-call",
+              toolCallId: `memory-${calls}`,
+              toolName: "updateWorkingMemory",
+              input: JSON.stringify({ memory: { preference: "green" } }),
+            },
+          ],
+          "tool-calls",
+        );
+      return textStream("done");
+    },
+  });
+  const adapter = createMemoryReplayAgent(
+    ({ memory }) => ({
+      id: "second-step-memory",
+      name: "Second-step memory",
+      instructions: "Update memory after advancing",
+      model,
+      memory,
+      defaultOptions: { maxSteps: 4 },
+      tools: {
+        advance: createTool({
+          id: "advance",
+          description: "Advance to the next step",
+          inputSchema: z.object({}),
+          execute: advance,
+        }),
+      },
+    }),
+    {
+      agentId: AGENT_ID,
+      apiUrl: "https://kitaru.invalid",
+      requestedModelId: "fixture/actor",
+      sourceMemory: () => ({
+        settled: () => runtime.memory.settled(),
+        domain: runtime.domain,
+        configuration: runtime.memory.getMergedThreadConfig(),
+        exclusiveAccess: access,
+      }),
+      resolveModel: (id) =>
+        id.includes("observer")
+          ? runtime.observer.model
+          : id.includes("reflector")
+            ? runtime.reflector.model
+            : model,
+    },
+  );
+  try {
+    const baseline = await adapter.stream("Remember green", {
+      memory: { thread: THREAD, resource: RESOURCE },
+    });
+    await baseline.consumeStream();
+    await vi.waitFor(() =>
+      expect(
+        api.calls.some(
+          (call) =>
+            call.method === "PATCH" &&
+            (call.body?.metadata as Record<string, unknown> | undefined)
+              ?.mastra_replay_state === "eligible",
+        ),
+      ).toBe(true),
+    );
+    const input = api.calls.find(
+      (call) =>
+        call.method === "PATCH" &&
+        (call.body?.metadata as Record<string, unknown> | undefined)
+          ?.mastra_replay_state === "eligible",
+    )?.body?.inputs;
+    vi.stubEnv("KITARU_REPLAY_ID", REPLAY_ID);
+    vi.stubEnv("KITARU_TASK_INPUTS", JSON.stringify(input));
+    const replay = await adapter.stream("ignored");
+    await replay.consumeStream();
+    expect(await replay.text).toBe("done");
+    expect(advance).toHaveBeenCalledTimes(2);
+    expect(api.calls.some((call) => call.path.endsWith("/tool-lookup"))).toBe(
+      false,
+    );
+  } finally {
+    await runtime.store.close();
+  }
 });
 
 import {
@@ -206,14 +332,40 @@ it("records and replays native evolving memory without re-resolving live configu
   });
   await baseline.consumeStream();
   expect(dynamicCalls).toEqual(["instructions", "model", "defaults"]);
+  await vi.waitFor(() =>
+    expect(
+      baselineApi.calls.some(
+        (call) =>
+          call.method === "PATCH" &&
+          (call.body?.metadata as Record<string, unknown> | undefined)
+            ?.mastra_replay_state === "eligible",
+      ),
+    ).toBe(true),
+  );
   const recorded = baselineApi.calls.find(
-    (call) => call.method === "POST" && call.path === "/api/v1/sessions",
+    (call) =>
+      call.method === "PATCH" &&
+      (call.body?.metadata as Record<string, unknown> | undefined)
+        ?.mastra_replay_state === "eligible",
   )?.body?.inputs;
   expect(recorded).toHaveProperty(MEMORY_REPLAY_KEY);
   expect(
-    baselineApi.calls.filter((call) => call.method === "PATCH").at(-1)?.body
-      ?.status,
-  ).toBe("completed");
+    baselineApi.calls.find(
+      (call) => call.method === "POST" && call.path === "/api/v1/sessions",
+    )?.body?.metadata,
+  ).toMatchObject({
+    mastra_replay_state: "pending",
+    mastra_native_state: "pending",
+  });
+  expect(
+    baselineApi.calls.filter((call) => call.method === "PATCH").at(-1)?.body,
+  ).toMatchObject({
+    status: "completed",
+    metadata: {
+      mastra_replay_state: "eligible",
+      mastra_native_state: "completed",
+    },
+  });
   const baselineNodes = baselineApi.nodeBatches().flat();
   expect(baselineNodes.some((node) => node.name === "memory_mutation")).toBe(
     true,
@@ -225,9 +377,10 @@ it("records and replays native evolving memory without re-resolving live configu
   ).toBe(true);
   expect(
     baselineNodes.find((node) => node.node_type === "llm_call")?.attributes,
-  ).toHaveProperty("prompt_provenance.extraContext.context", [
-    { role: "system", content: "Extra context. Original instructions" },
-  ]);
+  ).toHaveProperty(
+    "prompt_provenance.extraContextRef",
+    "mastra_memory_replay.configuration",
+  );
   await runtime.memory.updateWorkingMemory({
     threadId: THREAD,
     resourceId: RESOURCE,
@@ -269,7 +422,7 @@ it("records and replays native evolving memory without re-resolving live configu
   await runtime.store.close();
 });
 
-it("waits for owned native observation before reporting completion and releases its lease", async () => {
+it("finishes the native stream before delayed observation and finalizes replay later", async () => {
   let release!: () => void;
   let started!: () => void;
   const blocked = new Promise<void>((resolve) => {
@@ -326,17 +479,44 @@ it("waits for owned native observation before reporting completion and releases 
         (call) => call.method === "PATCH" && call.body?.status === "completed",
       ),
     ).toBe(false);
-    release();
     await consuming;
+    expect(await result.text).toBe("done");
     expect(
-      api.calls.filter((call) => call.method === "PATCH").at(-1)?.body?.status,
-    ).toBe("completed");
+      api.calls.some(
+        (call) => call.method === "PATCH" && call.body?.status === "completed",
+      ),
+    ).toBe(false);
+    release();
+    await vi.waitFor(() =>
+      expect(
+        api.calls.filter((call) => call.method === "PATCH").at(-1)?.body,
+      ).toMatchObject({
+        status: "completed",
+        metadata: { mastra_replay_state: "eligible" },
+      }),
+    );
     const releaseLease = await lease.acquire({
       threadId: THREAD,
       resourceId: RESOURCE,
     });
     await releaseLease();
     expect(runtime.observer.calls.length).toBeGreaterThan(0);
+    const observerCalls = runtime.observer.calls.length;
+    const reflectorCalls = runtime.reflector.calls.length;
+    const finalizedInputs = api.calls.find(
+      (call) =>
+        call.method === "PATCH" &&
+        (call.body?.metadata as Record<string, unknown> | undefined)
+          ?.mastra_replay_state === "eligible",
+    )?.body?.inputs;
+    expect(finalizedInputs).toHaveProperty(MEMORY_REPLAY_KEY);
+    vi.stubEnv("KITARU_REPLAY_ID", REPLAY_ID);
+    vi.stubEnv("KITARU_TASK_INPUTS", JSON.stringify(finalizedInputs));
+    const replay = await adapter.stream("ignored");
+    await replay.consumeStream();
+    expect(await replay.text).toBe("done");
+    expect(runtime.observer.calls).toHaveLength(observerCalls);
+    expect(runtime.reflector.calls).toHaveLength(reflectorCalls);
     expect(
       api
         .nodeBatches()
@@ -368,10 +548,11 @@ it("keeps baseline output when initial snapshot evidence fails and rejects its i
     configuration: runtime.memory.getMergedThreadConfig(),
     exclusiveAccess: createProcessLocalMemoryAccess(),
   }));
+  const modelCalls = vi.fn(async () => textStream("native output"));
   const model = new MastraLanguageModelV2Mock({
     modelId: "actor",
     provider: "fixture",
-    doStream: async () => textStream("native output"),
+    doStream: modelCalls,
   });
   const adapter = createMemoryReplayAgent(
     ({ memory }) => ({
@@ -398,14 +579,364 @@ it("keeps baseline output when initial snapshot evidence fails and rejects its i
     (call) => call.method === "POST" && call.path === "/api/v1/sessions",
   )?.body?.inputs as Record<string, { complete: boolean }>;
   expect(input[MEMORY_REPLAY_KEY]?.complete).toBe(false);
+  await vi.waitFor(() =>
+    expect(
+      api.calls.find(
+        (call) =>
+          call.method === "PATCH" &&
+          call.body?.status === "failed" &&
+          call.body?.metadata &&
+          (call.body.metadata as Record<string, unknown>)
+            .mastra_replay_state === "ineligible",
+      )?.body?.metadata,
+    ).toMatchObject({
+      mastra_replay_state: "ineligible",
+      mastra_replay_reason: "memory_evidence_incomplete",
+      mastra_native_state: "completed",
+    }),
+  );
   vi.stubEnv("KITARU_REPLAY_ID", REPLAY_ID);
   vi.stubEnv("KITARU_TASK_INPUTS", JSON.stringify(input));
-  await expect(adapter.stream("ignored")).rejects.toThrow(/incomplete/i);
+  await expect(adapter.stream("ignored")).rejects.toThrow(
+    /complete version-3/i,
+  );
   expect(source).toHaveBeenCalledTimes(1);
+  expect(modelCalls).toHaveBeenCalledTimes(1);
   await runtime.store.close();
 });
 
-it("rebuilds observation/reflection on the replay trajectory with an overridden actor model", async () => {
+it("runs natively when request context cannot be captured safely", async () => {
+  const runtime = createMemoryRuntime({ messageTokens: 10000 });
+  await seedMemory(runtime);
+  const api = installTestApi();
+  const access = createProcessLocalMemoryAccess();
+  const unsafeWrite = vi.spyOn(access, "markUnsafeWrite");
+  const model = new MastraLanguageModelV2Mock({
+    modelId: "actor",
+    provider: "fixture",
+    doStream: async () => textStream("native answer"),
+  });
+  const adapter = createMemoryReplayAgent(
+    ({ memory }) => ({
+      id: "unsupported-context",
+      name: "Unsupported context",
+      instructions: "Answer",
+      memory,
+      model,
+    }),
+    {
+      agentId: AGENT_ID,
+      apiUrl: "https://kitaru.invalid",
+      requestedModelId: "fixture/actor",
+      sourceMemory: () => ({
+        settled: () => runtime.memory.settled(),
+        domain: runtime.domain,
+        configuration: runtime.memory.getMergedThreadConfig(),
+        exclusiveAccess: access,
+      }),
+      resolveModel: () => model,
+      captureRequestContext: () => ({ [MASTRA_AUTH_TOKEN_KEY]: "secret" }),
+    },
+  );
+  const output = await adapter.stream("Hello", {
+    memory: { thread: THREAD, resource: RESOURCE },
+  });
+  await output.consumeStream();
+  expect(await output.text).toBe("native answer");
+  await vi.waitFor(() =>
+    expect(
+      api.calls.find(
+        (call) => call.method === "POST" && call.path === "/api/v1/sessions",
+      )?.body?.metadata,
+    ).toMatchObject({
+      mastra_replay_state: "ineligible",
+      mastra_replay_reason: "context_unsupported",
+    }),
+  );
+  expect(JSON.stringify(api.calls)).not.toContain("secret");
+  expect(unsafeWrite).toHaveBeenCalledWith({
+    threadId: THREAD,
+    resourceId: RESOURCE,
+  });
+  const next = await access.acquire({ threadId: THREAD, resourceId: RESOURCE });
+  expect(await next.verifyEligibility()).toBe(false);
+  await next();
+  await runtime.memory.settled();
+  await runtime.store.close();
+});
+
+it("poisons all source threads when a native fallback has only an implicit selector", async () => {
+  const runtime = createMemoryRuntime({ messageTokens: 10000 });
+  await seedMemory(runtime);
+  installTestApi();
+  const access = createProcessLocalMemoryAccess();
+  const unsafeWrite = vi.spyOn(access, "markUnsafeWrite");
+  const model = new MastraLanguageModelV2Mock({
+    modelId: "actor",
+    provider: "fixture",
+    doStream: async () => textStream("native answer"),
+  });
+  const adapter = createMemoryReplayAgent(
+    ({ memory }) => ({
+      id: "implicit-native-fallback",
+      name: "Implicit native fallback",
+      instructions: "Answer",
+      memory,
+      model,
+      defaultOptions: {
+        memory: { thread: THREAD, resource: RESOURCE },
+      },
+    }),
+    {
+      agentId: AGENT_ID,
+      apiUrl: "https://kitaru.invalid",
+      requestedModelId: "fixture/actor",
+      sourceMemory: () => ({
+        settled: () => runtime.memory.settled(),
+        domain: runtime.domain,
+        configuration: runtime.memory.getMergedThreadConfig(),
+        exclusiveAccess: access,
+      }),
+      resolveModel: () => model,
+    },
+  );
+  try {
+    const output = await adapter.stream("Hello");
+    await output.consumeStream();
+    expect(await output.text).toBe("native answer");
+    expect(unsafeWrite).toHaveBeenCalledWith(undefined);
+    const next = await access.acquire({
+      threadId: THREAD,
+      resourceId: RESOURCE,
+    });
+    expect(await next.verifyEligibility()).toBe(false);
+    await next();
+  } finally {
+    await runtime.store.close();
+  }
+});
+
+it("keeps the native answer moving when unsafe-write coordination hangs", async () => {
+  const runtime = createMemoryRuntime({ messageTokens: 10000 });
+  await seedMemory(runtime);
+  installTestApi();
+  const reported = vi.fn();
+  const access = {
+    ...createProcessLocalMemoryAccess(),
+    markUnsafeWrite: vi.fn(() => new Promise<void>(() => undefined)),
+  };
+  const model = new MastraLanguageModelV2Mock({
+    modelId: "actor",
+    provider: "fixture",
+    doStream: async () => textStream("native answer"),
+  });
+  const adapter = createMemoryReplayAgent(
+    ({ memory }) => ({
+      id: "hung-unsafe-marker",
+      name: "Hung unsafe marker",
+      instructions: "Answer",
+      memory,
+      model,
+    }),
+    {
+      agentId: AGENT_ID,
+      apiUrl: "https://kitaru.invalid",
+      onRecordingError: reported,
+      requestedModelId: "fixture/actor",
+      sourceMemory: () => ({
+        settled: () => runtime.memory.settled(),
+        domain: runtime.domain,
+        configuration: runtime.memory.getMergedThreadConfig(),
+        exclusiveAccess: access,
+      }),
+      resolveModel: () => model,
+      captureRequestContext: () => ({ [MASTRA_AUTH_TOKEN_KEY]: "secret" }),
+    },
+  );
+  try {
+    const output = await adapter.stream("Hello", {
+      memory: { thread: THREAD, resource: RESOURCE },
+    });
+    await output.consumeStream();
+    expect(await output.text).toBe("native answer");
+    expect(access.markUnsafeWrite).toHaveBeenCalledOnce();
+    expect(reported).toHaveBeenCalledWith(
+      expect.objectContaining({
+        error: expect.objectContaining({
+          message: "Source-thread unsafe marker timed out.",
+        }),
+      }),
+    );
+  } finally {
+    await runtime.store.close();
+  }
+}, 2000);
+
+it("classifies an unrelated resource setup error as capture setup failure", async () => {
+  const runtime = createMemoryRuntime({ messageTokens: 10000 });
+  await seedMemory(runtime);
+  const api = installTestApi();
+  let factoryCalls = 0;
+  const model = new MastraLanguageModelV2Mock({
+    modelId: "actor",
+    provider: "fixture",
+    doStream: async () => textStream("native answer"),
+  });
+  const adapter = createMemoryReplayAgent(
+    ({ memory }) => {
+      if (++factoryCalls === 1)
+        throw new Error("resource registry temporarily unavailable");
+      return {
+        id: "resource-setup-failure",
+        name: "Resource setup failure",
+        instructions: "Answer",
+        model,
+        memory,
+      };
+    },
+    {
+      agentId: AGENT_ID,
+      apiUrl: "https://kitaru.invalid",
+      requestedModelId: "fixture/actor",
+      sourceMemory: () => ({
+        settled: () => runtime.memory.settled(),
+        domain: runtime.domain,
+        configuration: runtime.memory.getMergedThreadConfig(),
+        exclusiveAccess: createProcessLocalMemoryAccess(),
+      }),
+      resolveModel: () => model,
+    },
+  );
+  try {
+    const output = await adapter.stream("Hello", {
+      memory: { thread: THREAD, resource: RESOURCE },
+    });
+    await output.consumeStream();
+    expect(await output.text).toBe("native answer");
+    await vi.waitFor(() =>
+      expect(
+        api.calls.find(
+          (call) => call.method === "POST" && call.path === "/api/v1/sessions",
+        )?.body?.metadata,
+      ).toMatchObject({ mastra_replay_reason: "capture_setup_failed" }),
+    );
+  } finally {
+    await runtime.store.close();
+  }
+});
+
+it("passes the original request context to baseline resolvers while recording only approved values", async () => {
+  const runtime = createMemoryRuntime({ messageTokens: 10000 });
+  await seedMemory(runtime);
+  const api = installTestApi();
+  const seen: unknown[] = [];
+  const model = new MastraLanguageModelV2Mock({
+    modelId: "actor",
+    provider: "fixture",
+    doStream: async () => textStream("native answer"),
+  });
+  const adapter = createMemoryReplayAgent(
+    ({ memory }) => ({
+      id: "native-context",
+      name: "Native context",
+      instructions: ({ requestContext }) => {
+        seen.push(requestContext.get("accessToken"));
+        return "Answer";
+      },
+      memory,
+      model,
+    }),
+    {
+      agentId: AGENT_ID,
+      apiUrl: "https://kitaru.invalid",
+      requestedModelId: "fixture/actor",
+      sourceMemory: () => ({
+        settled: () => runtime.memory.settled(),
+        domain: runtime.domain,
+        configuration: runtime.memory.getMergedThreadConfig(),
+        exclusiveAccess: createProcessLocalMemoryAccess(),
+      }),
+      resolveModel: () => model,
+      captureRequestContext: (context) => ({ locale: context.get("locale") }),
+    },
+  );
+  const context = new RequestContext();
+  context.set("accessToken", "private-token");
+  context.set("locale", "nl");
+  const output = await adapter.stream("Hello", {
+    memory: { thread: THREAD, resource: RESOURCE },
+    requestContext: context,
+  });
+  await output.consumeStream();
+  expect(await output.text).toBe("native answer");
+  expect(seen).toContain("private-token");
+  expect(JSON.stringify(api.calls)).not.toContain("private-token");
+  const recordedInputs = api.calls.find(
+    (call) => call.method === "POST" && call.path === "/api/v1/sessions",
+  )?.body?.inputs as Record<string, { requestContext: unknown }> | undefined;
+  expect(recordedInputs?.[MEMORY_REPLAY_KEY]?.requestContext).toMatchObject({
+    locale: "nl",
+  });
+  await runtime.memory.settled();
+  await runtime.store.close();
+});
+
+it("runs natively and reports locally when Kitaru session creation fails", async () => {
+  const runtime = createMemoryRuntime({ messageTokens: 10000 });
+  await seedMemory(runtime);
+  installTestApi();
+  const reported = vi.fn();
+  const originalFetch = globalThis.fetch;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn<typeof globalThis.fetch>(async (input, init) => {
+      if (
+        init?.method === "POST" &&
+        new URL(String(input)).pathname === "/api/v1/sessions"
+      )
+        throw new Error("Kitaru unavailable");
+      return originalFetch(input, init);
+    }),
+  );
+  const model = new MastraLanguageModelV2Mock({
+    modelId: "actor",
+    provider: "fixture",
+    doStream: async () => textStream("native answer"),
+  });
+  const adapter = createMemoryReplayAgent(
+    ({ memory }) => ({
+      id: "outage",
+      name: "Outage",
+      instructions: "Answer",
+      memory,
+      model,
+    }),
+    {
+      agentId: AGENT_ID,
+      apiUrl: "https://kitaru.invalid",
+      onRecordingError: reported,
+      requestedModelId: "fixture/actor",
+      sourceMemory: () => ({
+        settled: () => runtime.memory.settled(),
+        domain: runtime.domain,
+        configuration: runtime.memory.getMergedThreadConfig(),
+        exclusiveAccess: createProcessLocalMemoryAccess(),
+      }),
+      resolveModel: () => model,
+    },
+  );
+  const output = await adapter.stream("Hello", {
+    memory: { thread: THREAD, resource: RESOURCE },
+  });
+  await output.consumeStream();
+  expect(await output.text).toBe("native answer");
+  await vi.waitFor(() => expect(reported).toHaveBeenCalledTimes(1));
+  expect(reported.mock.calls[0]?.[0]).toMatchObject({ stage: "complete" });
+  await runtime.memory.settled();
+  await runtime.store.close();
+});
+
+it("reports OM divergence when an override adds a new memory call", async () => {
   const runtime = createMemoryRuntime({ messageTokens: 600 });
   await seedMemory(runtime);
   const api = installTestApi({
@@ -508,9 +1039,24 @@ it("rebuilds observation/reflection on the replay trajectory with an overridden 
     memory: { thread: THREAD, resource: RESOURCE },
   });
   await baseline.consumeStream();
+  await vi.waitFor(() =>
+    expect(
+      api.calls.some(
+        (call) =>
+          call.method === "PATCH" &&
+          (call.body?.metadata as Record<string, unknown> | undefined)
+            ?.mastra_replay_state === "eligible",
+      ),
+    ).toBe(true),
+  );
   const input = api.calls.find(
-    (call) => call.method === "POST" && call.path === "/api/v1/sessions",
+    (call) =>
+      call.method === "PATCH" &&
+      (call.body?.metadata as Record<string, unknown> | undefined)
+        ?.mastra_replay_state === "eligible",
   )?.body?.inputs;
+  const observerCalls = runtime.observer.calls.length;
+  const reflectorCalls = runtime.reflector.calls.length;
   vi.stubEnv("KITARU_REPLAY_ID", REPLAY_ID);
   vi.stubEnv("KITARU_TASK_INPUTS", JSON.stringify(input));
   const nativeStream = Agent.prototype.stream;
@@ -526,27 +1072,20 @@ it("rebuilds observation/reflection on the replay trajectory with an overridden 
   expect(output).toBe(nativeResult);
   await output.consumeStream();
   expect(await output.text).toBe("evolved");
-  expect(requests).toHaveLength(3);
-  expect(runtime.observer.calls.length).toBeGreaterThan(0);
-  expect(runtime.reflector.calls.length).toBeGreaterThan(0);
-  expect(JSON.stringify(requests[2])).toContain("REFLECTED_REPLAY");
-  const resultNodes = api.nodeBatches(api.sessionIds[1]).flat();
-  expect(
-    resultNodes
-      .filter((node) => node.node_type === "llm_call")
-      .every((node) => node.model === "replacement"),
-  ).toBe(true);
-  expect(
-    resultNodes.some(
-      (node) =>
-        node.name === "memory_mutation" &&
-        (node.attributes as Record<string, unknown>).memory_method ===
-          "createReflectionGeneration",
-    ),
-  ).toBe(true);
-  expect(
-    api.calls.filter((call) => call.method === "PATCH").at(-1)?.body?.status,
-  ).toBe("completed");
+  expect(runtime.observer.calls).toHaveLength(observerCalls);
+  expect(runtime.reflector.calls).toHaveLength(reflectorCalls);
+  await vi.waitFor(() =>
+    expect(
+      api.calls.filter((call) => call.method === "PATCH").at(-1)?.body,
+    ).toMatchObject({
+      status: "failed",
+      error: "KITARU_REPLAY_DIVERGED:mastra_om_call_order",
+      metadata: {
+        mastra_replay_state: "diverged",
+        mastra_replay_reason: "mastra_om_call_order",
+      },
+    }),
+  );
   expect(
     await runtime.memory.getWorkingMemory({
       threadId: THREAD,
@@ -620,7 +1159,7 @@ it("releases the source lease on setup failure and cancellation", async () => {
   await runtime.store.close();
 });
 
-it("stops later actor and tool work after native memory storage fails", async () => {
+it("preserves native continuation after a memory storage write fails", async () => {
   const runtime = createMemoryRuntime({ messageTokens: 10000 });
   await seedMemory(runtime);
   const api = installTestApi();
@@ -658,7 +1197,7 @@ it("stops later actor and tool work after native memory storage fails", async ()
             ],
             "tool-calls",
           )
-        : textStream("incorrect continuation"),
+        : textStream("native continuation"),
   });
   const adapter = createMemoryReplayAgent(
     ({ memory }) => ({
@@ -691,18 +1230,38 @@ it("stops later actor and tool work after native memory storage fails", async ()
     },
   );
   try {
+    const onFinish = vi.fn();
     const output = await adapter.stream("Remember green", {
       memory: { thread: THREAD, resource: RESOURCE },
+      onFinish,
     });
     await output.consumeStream();
+    expect(await output.text).toBe("native continuation");
+    expect(onFinish).toHaveBeenCalledTimes(1);
+    expect(onFinish.mock.calls[0]?.[0]?.steps?.at(-1)?.finishReason).toBe(
+      "stop",
+    );
     await vi.waitFor(() =>
       expect(
         api.calls.filter((call) => call.method === "PATCH").at(-1)?.body
           ?.status,
       ).toBe("failed"),
     );
-    expect(actorCalls).toBe(1);
-    expect(external).not.toHaveBeenCalled();
+    expect(actorCalls).toBe(2);
+    expect(external).toHaveBeenCalledTimes(1);
+    expect(
+      api.calls.find(
+        (call) =>
+          call.method === "PATCH" &&
+          call.body?.status === "failed" &&
+          (call.body?.metadata as Record<string, unknown> | undefined)
+            ?.mastra_replay_state === "ineligible",
+      )?.body?.metadata,
+    ).toMatchObject({
+      mastra_replay_state: "ineligible",
+      mastra_replay_reason: "memory_mutation_failed",
+      mastra_native_state: "completed",
+    });
     const release = await lease.acquire({
       threadId: THREAD,
       resourceId: RESOURCE,

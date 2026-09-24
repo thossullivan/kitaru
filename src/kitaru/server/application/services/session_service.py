@@ -404,12 +404,23 @@ class SessionService:
         await check_task_attempt(actor, self._tasks)
         session.check_update()
         fields = command.model_fields_set
+        target_status = session.status
+        if "status" in fields:
+            if command.status is None:
+                raise SessionStatusCannotBeCleared(session_id)
+            target_status = command.status
+        next_metadata = (
+            (command.metadata if command.metadata is not None else {})
+            if "metadata" in fields
+            else session.metadata
+        )
+        session.check_replay_finalization(
+            status=target_status,
+            metadata=next_metadata,
+            inputs=command.inputs,
+            replacing_inputs="inputs" in fields,
+        )
         if {"status", "outputs", "output_text_selector", "error", "ended_at"} & fields:
-            target_status = session.status
-            if "status" in fields:
-                if command.status is None:
-                    raise SessionStatusCannotBeCleared(session_id)
-                target_status = command.status
             session.finish(
                 status=target_status,
                 output_text_selector=command.output_text_selector
@@ -437,12 +448,15 @@ class SessionService:
                     AnalyticsEvent.SESSION_COMPLETED,
                     analytics_events.build_session_completed_properties(session),
                 )
+        if "inputs" in fields:
+            session.inputs = Payload.from_json(command.inputs)
+            await self._payload_store.offload([session.inputs], session.owner_id)
         if "name" in fields:
             session.update_name(command.name)
         if "metadata" in fields:
-            session.update_metadata(
-                command.metadata if command.metadata is not None else {}
-            )
+            session.update_metadata(next_metadata)
+        if "inputs" in fields:
+            return await self._repository.finalize_replay_inputs(session)
         return await self._repository.update(session)
 
     async def delete_session(self, session_id: uuid.UUID, actor: AuthContext) -> None:

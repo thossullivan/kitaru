@@ -14,6 +14,7 @@
 """Tests for session use cases."""
 
 import uuid
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -72,6 +73,7 @@ from kitaru.server.domain.session import (
     SessionInUse,
     SessionNotFound,
     SessionNotUpdatable,
+    SessionReplayFinalizationInvalid,
     SessionStatusCannotBeCleared,
 )
 from kitaru.server.domain.task import (
@@ -450,6 +452,171 @@ async def test_update_session_clears_outputs_with_explicit_null(
     )
     assert updated.outputs is None
     assert updated.status == SessionStatus.COMPLETED
+
+
+async def test_finalize_pending_mastra_replay_inputs_atomically(
+    service: SessionService,
+    complete_mastra_memory_replay_inputs: dict[str, Any],
+) -> None:
+    """Publish final replay input and eligibility in one guarded transition."""
+    created = await service.create_session(
+        SessionCreate(
+            agent_id=uuid.uuid4(),
+            origin=SessionOrigin.RECORDED,
+            framework="mastra",
+            inputs={"mastra_memory_replay": {"version": 3, "complete": False}},
+            metadata={"mastra_replay_state": "pending"},
+        ),
+        actor=ACTOR,
+    )
+    final_inputs = complete_mastra_memory_replay_inputs
+    await service.update_session(
+        created.id,
+        SessionUpdate(
+            status=SessionStatus.COMPLETED,
+            inputs=final_inputs,
+            metadata={"mastra_replay_state": "eligible"},
+        ),
+        actor=ACTOR,
+    )
+    stored = await service.get_session(created.id, actor=ACTOR)
+    assert stored.status == SessionStatus.COMPLETED
+    assert stored.inputs is not None and stored.inputs.value == final_inputs
+    assert stored.metadata["mastra_replay_state"] == "eligible"
+
+
+@pytest.mark.parametrize("invalid_field", ["raw_input", "file_hash"])
+async def test_mastra_finalization_rejects_invalid_replay_prerequisite(
+    service: SessionService,
+    complete_mastra_memory_replay_inputs: dict[str, Any],
+    invalid_field: str,
+) -> None:
+    """An eligible marker cannot accompany an incomplete v3 envelope."""
+    created = await service.create_session(
+        SessionCreate(
+            agent_id=uuid.uuid4(),
+            origin=SessionOrigin.RECORDED,
+            framework="mastra",
+            inputs={"mastra_memory_replay": {"version": 3, "complete": False}},
+            metadata={"mastra_replay_state": "pending"},
+        ),
+        actor=ACTOR,
+    )
+    invalid = deepcopy(complete_mastra_memory_replay_inputs)
+    if invalid_field == "raw_input":
+        del invalid["mastra_memory_replay"]["rawInput"]
+    else:
+        invalid["mastra_memory_replay"]["files"][0]["sha256"] = "0" * 64
+    with pytest.raises(SessionReplayFinalizationInvalid):
+        await service.update_session(
+            created.id,
+            SessionUpdate(
+                status=SessionStatus.COMPLETED,
+                inputs=invalid,
+                metadata={"mastra_replay_state": "eligible"},
+            ),
+            actor=ACTOR,
+        )
+    stored = await service.get_session(created.id, actor=ACTOR)
+    assert stored.status == SessionStatus.IN_PROGRESS
+    assert stored.metadata["mastra_replay_state"] == "pending"
+
+
+async def test_unrelated_session_cannot_replace_inputs(
+    service: SessionService,
+) -> None:
+    """The replay finalization input patch is restricted to pending Mastra records."""
+    created = await service.create_session(
+        SessionCreate(
+            agent_id=uuid.uuid4(),
+            origin=SessionOrigin.RECORDED,
+            framework="langgraph",
+            inputs={"original": True},
+        ),
+        actor=ACTOR,
+    )
+    with pytest.raises(SessionReplayFinalizationInvalid):
+        await service.update_session(
+            created.id,
+            SessionUpdate(
+                status=SessionStatus.COMPLETED,
+                inputs={"changed": True},
+                metadata={"mastra_replay_state": "eligible"},
+            ),
+            actor=ACTOR,
+        )
+    stored = await service.get_session(created.id, actor=ACTOR)
+    assert stored.status == SessionStatus.IN_PROGRESS
+    assert stored.inputs is not None and stored.inputs.value == {"original": True}
+
+
+async def test_pending_mastra_ineligibility_is_terminal(
+    service: SessionService,
+) -> None:
+    """A failed recording cannot expose an eligible-looking pending input."""
+    created = await service.create_session(
+        SessionCreate(
+            agent_id=uuid.uuid4(),
+            origin=SessionOrigin.RECORDED,
+            framework="mastra",
+            inputs={"mastra_memory_replay": {"version": 2, "complete": False}},
+            metadata={"mastra_replay_state": "pending"},
+        ),
+        actor=ACTOR,
+    )
+    with pytest.raises(SessionReplayFinalizationInvalid):
+        await service.update_session(
+            created.id,
+            SessionUpdate(metadata={"mastra_replay_state": "ineligible"}),
+            actor=ACTOR,
+        )
+    updated = await service.update_session(
+        created.id,
+        SessionUpdate(
+            status=SessionStatus.COMPLETED,
+            metadata={
+                "mastra_replay_state": "ineligible",
+                "mastra_replay_reason": "capture_incomplete",
+            },
+        ),
+        actor=ACTOR,
+    )
+    assert updated.status == SessionStatus.COMPLETED
+    assert updated.metadata["mastra_replay_reason"] == "capture_incomplete"
+
+
+async def test_mastra_om_cannot_be_finalized_without_result_tape(
+    service: SessionService,
+) -> None:
+    """An OM session cannot claim eligibility before its tape is persisted."""
+    created = await service.create_session(
+        SessionCreate(
+            agent_id=uuid.uuid4(),
+            origin=SessionOrigin.RECORDED,
+            framework="mastra",
+            inputs={"mastra_memory_replay": {"version": 3, "complete": False}},
+            metadata={"mastra_replay_state": "pending"},
+        ),
+        actor=ACTOR,
+    )
+    with pytest.raises(SessionReplayFinalizationInvalid):
+        await service.update_session(
+            created.id,
+            SessionUpdate(
+                status=SessionStatus.COMPLETED,
+                inputs={
+                    "mastra_memory_replay": {
+                        "version": 3,
+                        "complete": True,
+                        "configuration": {
+                            "memoryConfig": {"observationalMemory": {"scope": "thread"}}
+                        },
+                    }
+                },
+                metadata={"mastra_replay_state": "eligible"},
+            ),
+            actor=ACTOR,
+        )
 
 
 async def test_update_session_omitted_fields_unchanged(

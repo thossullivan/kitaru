@@ -1,11 +1,13 @@
 import { createHash } from "node:crypto";
-import { lstat, readdir, readFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat, open, readdir } from "node:fs/promises";
 import { join, posix } from "node:path";
 import type { SkillSource, SkillSourceEntry } from "@mastra/core/workspace";
 import { MAX_RECORDED_PAYLOAD_CHARS } from "@zenml-io/kitaru/adapter";
 
 export interface SkillsManifest {
   files: { path: string; length: number; sha256: string }[];
+  directories: string[];
 }
 
 /** Read and pin an artifact's skills. Native tools subsequently read only these bytes. */
@@ -24,6 +26,7 @@ export async function loadSkillsWorkspace(
       throw new Error("Unsupported Mastra skills symlink");
     if (info.isDirectory()) {
       const entries = await readdir(path, { withFileTypes: true });
+      entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
       directories.set(
         relative,
         entries.map((entry) => ({
@@ -31,14 +34,24 @@ export async function loadSkillsWorkspace(
           type: entry.isDirectory() ? "directory" : "file",
         })),
       );
-      for (const entry of entries.sort((a, b) =>
-        a.name < b.name ? -1 : a.name > b.name ? 1 : 0,
-      ))
+      for (const entry of entries)
         await visit(posix.join(relative, entry.name));
     } else if (info.isFile()) {
       if (size + info.size > MAX_RECORDED_PAYLOAD_CHARS)
         throw new Error("Skills content exceeds the supported replay limit");
-      const content = await readFile(path);
+      // O_NOFOLLOW closes the gap between lstat and the read if a file is swapped.
+      const handle = await open(
+        path,
+        constants.O_RDONLY | constants.O_NOFOLLOW,
+      );
+      let content: Buffer;
+      try {
+        if (!(await handle.stat()).isFile())
+          throw new Error("Unsupported Mastra skills file type");
+        content = await handle.readFile();
+      } finally {
+        await handle.close();
+      }
       size += content.length;
       files.set(relative, content);
     } else throw new Error("Unsupported Mastra skills file type");
@@ -55,6 +68,7 @@ export async function loadSkillsWorkspace(
       length: content.length,
       sha256: createHash("sha256").update(content).digest("hex"),
     })),
+    directories: [...directories.keys()].sort(),
   };
   if (
     expectedManifest &&

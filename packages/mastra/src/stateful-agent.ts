@@ -7,12 +7,9 @@ import type { InputProcessor } from "@mastra/core/processors";
 import { RequestContext } from "@mastra/core/request-context";
 import type { MemoryStorage } from "@mastra/core/storage";
 import type { Memory } from "@mastra/memory";
+import { KitaruClient, type SessionNodeCreateRequest } from "@zenml-io/kitaru";
 import {
-  type JsonValue,
-  KitaruClient,
-  type SessionNodeCreateRequest,
-} from "@zenml-io/kitaru";
-import {
+  type AdapterClient,
   type AdapterRunState,
   normalizeRecordingLimits,
   parseModelSettings,
@@ -27,6 +24,7 @@ import {
 } from "./memory-binding.js";
 import {
   assertMemoryReplayVersions,
+  bindOMResultModels,
   createIsolatedMemoryReplay,
   getMemoryModelId,
   serializeMemoryConfiguration,
@@ -35,19 +33,26 @@ import {
   createMemoryReplayEnvelope,
   decodeMemoryValue,
   encodeMemoryValue,
+  finalizeMemoryReplayEnvelope,
   type MastraMemorySnapshot,
   MEMORY_REPLAY_KEY,
   restoreMemoryReplayEnvelope,
   validateMemoryReplayContext,
   validateMemoryReplaySelectors,
 } from "./memory-snapshot.js";
+import { createOMResultTape, type OMResultEntry } from "./om-result-tape.js";
 import { assertStableToolName } from "./replay-guards.js";
 import {
   createRequestCapture,
   type RequestEvidence,
   requestEvidenceAttributes,
 } from "./request-capture.js";
-import { createCapturedFiles, restoreCapturedFiles } from "./stateful-files.js";
+import {
+  createCapturedFiles,
+  createRecordedEvidenceSanitizer,
+  restoreCapturedFiles,
+  type UnsafeEvidenceReason,
+} from "./stateful-files.js";
 import {
   bindMemoryToolIdentity,
   createStatefulToolProcessors,
@@ -64,6 +69,33 @@ interface MastraMemorySource {
   domain: MemoryStorage;
   configuration: MemoryConfigInternal;
   exclusiveAccess: MastraExclusiveMemoryAccess;
+}
+
+function recordingClient(
+  client: KitaruClient,
+  sanitize: <T>(value: T) => T,
+  unsafeReason: () => string | undefined,
+): AdapterClient {
+  return {
+    createSession: (request) => client.createSession(sanitize(request)),
+    getReplay: client.getReplay.bind(client),
+    getTaskSpec: client.getTaskSpec.bind(client),
+    lookupToolResult: client.lookupToolResult.bind(client),
+    upsertSessionNodes: (sessionId, request) =>
+      client.upsertSessionNodes(sessionId, sanitize(request)),
+    updateSession: (sessionId, request) => {
+      const safe = sanitize(request);
+      const reason = unsafeReason();
+      if (reason && safe.metadata?.mastra_replay_state === "eligible") {
+        safe.metadata = {
+          ...safe.metadata,
+          mastra_replay_state: "ineligible",
+          mastra_replay_reason: reason,
+        };
+      }
+      return client.updateSession(sessionId, safe);
+    },
+  };
 }
 
 export interface MemoryReplayAgentOptions extends KitaruAgentOptions {
@@ -99,11 +131,14 @@ function requireRecord(value: unknown, label: string): Record<string, unknown> {
     throw new Error(`Unsupported Mastra memory replay: missing ${label}.`);
   return value;
 }
+class MemoryReplayContextError extends Error {}
+
 function getSelector(options: RuntimeStreamOptions) {
-  const memory = requireRecord(
-    options.memory,
-    "memory thread/resource selectors",
-  );
+  const memory = record(options.memory) ? options.memory : undefined;
+  if (!memory)
+    throw new MemoryReplayContextError(
+      "Memory replay requires explicit memory.thread and memory.resource strings.",
+    );
   const threadId =
     typeof memory.thread === "string"
       ? memory.thread
@@ -111,7 +146,7 @@ function getSelector(options: RuntimeStreamOptions) {
         ? memory.thread.id
         : undefined;
   if (typeof threadId !== "string" || typeof memory.resource !== "string")
-    throw new Error(
+    throw new MemoryReplayContextError(
       "Memory replay requires explicit memory.thread and memory.resource strings.",
     );
   return { threadId, resourceId: memory.resource };
@@ -215,28 +250,145 @@ export function createMemoryReplayAgent(
     apiUrl: options.apiUrl,
     timeoutMs: options.timeoutMs,
   });
-  async function stream(
+  async function runNativeBaseline(
+    rawInput: unknown,
+    callerOptions: RuntimeStreamOptions,
+  ): Promise<unknown> {
+    const { MastraCompositeStore } = await import("@mastra/core/storage");
+    const { Memory } = await import("@mastra/memory");
+    const source = await options.sourceMemory();
+    let unsafeSelector: { threadId: string; resourceId: string } | undefined;
+    try {
+      unsafeSelector = getSelector(callerOptions);
+    } catch {
+      // An implicit native selector can come from factory defaults.
+    }
+    try {
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          source.exclusiveAccess.markUnsafeWrite(unsafeSelector),
+          new Promise<never>((_resolve, reject) => {
+            timeout = setTimeout(
+              () => reject(new Error("Source-thread unsafe marker timed out.")),
+              100,
+            );
+          }),
+        ]);
+      } finally {
+        if (timeout) clearTimeout(timeout);
+      }
+    } catch (error) {
+      reportLocalRecordingError(error);
+    }
+    const memory = new Memory({
+      storage: new MastraCompositeStore({
+        id: `kitaru-native-${globalThis.crypto.randomUUID()}`,
+        domains: { memory: source.domain },
+      }),
+      options: source.configuration,
+    });
+    const workspace = options.skillsDirectory
+      ? await loadSkillsWorkspace(options.skillsDirectory)
+      : undefined;
+    const config = await factory({
+      memory,
+      resolveFile:
+        options.resolveFile ??
+        (async () => {
+          throw new Error("Missing controlled file resolver.");
+        }),
+      workspace: workspace?.workspace,
+    });
+    const native = new Agent({ ...config, memory }) as unknown as {
+      stream(input: unknown, options: RuntimeStreamOptions): Promise<unknown>;
+    };
+    return native.stream(rawInput, callerOptions);
+  }
+
+  function reportLocalRecordingError(error: unknown): void {
+    if (options.onRecordingError) {
+      void Promise.resolve()
+        .then(() => options.onRecordingError?.({ error, stage: "complete" }))
+        .catch(() => undefined);
+    } else {
+      console.warn("Kitaru memory recording is unavailable for this turn");
+    }
+  }
+
+  async function reportSetupFailure(
+    error: unknown,
+    reasonCode: string,
+  ): Promise<void> {
+    try {
+      const session = await client.createSession({
+        agent_id: options.agentId,
+        agent_version_id: options.agentVersionId,
+        adapter_version: (
+          createRequire(import.meta.url)("../package.json") as {
+            version: string;
+          }
+        ).version,
+        framework: "mastra",
+        inputs: {
+          [MEMORY_REPLAY_KEY]: { version: 2, complete: false },
+        },
+        metadata: {
+          mastra_replay_state: "ineligible",
+          mastra_replay_reason: reasonCode,
+          mastra_native_state: "started",
+        },
+        name: options.sessionName,
+        origin: "recorded",
+        outputs: null,
+        started_at: new Date().toISOString(),
+        status: "in_progress",
+      });
+      await client.updateSession(session.id, {
+        error: `KITARU_RECORDING_INCOMPLETE:${reasonCode}`,
+        ended_at: new Date().toISOString(),
+        status: "failed",
+      });
+    } catch {
+      reportLocalRecordingError(error);
+    }
+  }
+
+  async function recordedStream(
     rawInput: unknown,
     callerOptions: RuntimeStreamOptions = {},
+    markRecordingStreamEntered: () => void,
   ): Promise<unknown> {
     assertMemoryReplayVersions();
     const { resolveModelConfig } = await import("@mastra/core/llm");
     const { MastraCompositeStore } = await import("@mastra/core/storage");
     const startedAt = new Date().toISOString();
     const invocationId = globalThis.crypto.randomUUID();
+    let baselineFiles:
+      | Awaited<ReturnType<typeof createCapturedFiles>>
+      | undefined;
     const replay = await resolveReplayContext({
       allowedReplayModels: options.allowedReplayModels,
-      callerInput: encodeMemoryValue(rawInput),
+      callerInput: rawInput,
       client,
+      recordedInputProjector: async (input) => {
+        baselineFiles = await createCapturedFiles(
+          options.files ?? [],
+          options.resolveFile ??
+            (async () => {
+              throw new Error("Missing controlled file resolver.");
+            }),
+        );
+        return encodeMemoryValue(baselineFiles.replaceDeclaredFileUrls(input));
+      },
       requestedModelId: options.requestedModelId,
     });
     const historical = restoreMemoryReplayEnvelope(replay.effectiveInput);
     const invocationInput =
-      historical?.rawInput ??
-      decodeMemoryValue(replay.effectiveRuntimeInput as JsonValue);
+      historical?.rawInput ?? replay.effectiveRuntimeInput;
     if (Boolean(replay.spec) !== Boolean(historical))
       throw new Error(
-        "Memory replay requires a complete version-2 recorded invocation and an active Kitaru replay.",
+        "Memory replay requires a complete recorded invocation and an active Kitaru replay.",
       );
     if (replay.override?.prompt != null)
       throw new Error(
@@ -244,23 +396,36 @@ export function createMemoryReplayAgent(
       );
     const selector = historical?.initialSnapshot ?? getSelector(callerOptions);
     const liveContext = callerOptions.requestContext ?? new RequestContext();
-    if (!historical)
-      validateMemoryReplaySelectors(
-        selector,
-        Object.fromEntries(liveContext.entries()),
-      );
-    const recordedContext =
-      historical?.requestContext ??
-      options.captureRequestContext?.(liveContext) ??
-      Object.fromEntries(liveContext.entries());
+    if (!historical) {
+      try {
+        validateMemoryReplaySelectors(
+          selector,
+          Object.fromEntries(liveContext.entries()),
+        );
+      } catch {
+        throw new MemoryReplayContextError(
+          "Request context contains incompatible memory selectors.",
+        );
+      }
+    }
+    const recordedContext = historical?.requestContext ?? {};
     const safeContext = requireRecord(
       decodeMemoryValue(encodeMemoryValue(recordedContext)),
       "request context",
     );
-    validateMemoryReplayContext(selector, safeContext);
-    const requestContext = new MemoryReplayRequestContext(selector);
-    for (const [key, value] of Object.entries(safeContext))
-      requestContext.set(key, value);
+    try {
+      validateMemoryReplayContext(selector, safeContext);
+    } catch {
+      throw new MemoryReplayContextError(
+        "Request context is incompatible with recorded memory selectors.",
+      );
+    }
+    const requestContext = historical
+      ? new MemoryReplayRequestContext(selector)
+      : liveContext;
+    if (historical)
+      for (const [key, value] of Object.entries(safeContext))
+        requestContext.set(key, value);
     const abort = new AbortController();
     let state: AdapterRunState | undefined;
     let requestCapture: ReturnType<typeof createRequestCapture> | undefined;
@@ -269,9 +434,9 @@ export function createMemoryReplayAgent(
       return state;
     };
     const onIncomplete = (reason: string): void => {
-      // Mastra converts tool storage errors into results and otherwise continues.
-      // Recording-only incompleteness must preserve ordinary native execution.
-      if (reason !== "Native memory storage mutation failed.") return;
+      // Baseline diagnosis must not alter Mastra's native storage result.
+      if (!historical || reason !== "Native memory storage mutation failed.")
+        return;
       const error = new Error(reason);
       state?.storeFailure(error);
       abort.abort(error);
@@ -301,12 +466,32 @@ export function createMemoryReplayAgent(
           evidence_complete: event.complete,
         },
       });
+    const omCaptureErrors: string[] = [];
+    const omMismatches: OMResultEntry[] = [];
+    const omTape = createOMResultTape(
+      historical?.omTape as OMResultEntry[] | undefined,
+      (reason) => omCaptureErrors.push(reason),
+      (entry) => omMismatches.push(entry),
+    );
     let runtime: {
       memory: Memory;
       binding: MastraMemoryCaptureBinding;
       initialSnapshot: MastraMemorySnapshot | undefined;
       finish(): Promise<void>;
+      release(): Promise<void>;
     };
+    let unsafeEvidenceReason: UnsafeEvidenceReason | undefined;
+    let markUnknownOnBinding: (() => void) | undefined;
+    const markUnknownCredentialUrl = (reason: UnsafeEvidenceReason) => {
+      if (!unsafeEvidenceReason || reason === "credential_url")
+        unsafeEvidenceReason = reason;
+      markUnknownOnBinding?.();
+    };
+    const sanitizer = historical
+      ? createRecordedEvidenceSanitizer(new Map(), markUnknownCredentialUrl)
+      : baselineFiles?.evidenceSanitizer(markUnknownCredentialUrl);
+    if (!sanitizer)
+      throw new Error("Controlled evidence sanitizer was not initialized.");
     if (historical) {
       runtime = await createIsolatedMemoryReplay({
         invocationId,
@@ -319,6 +504,7 @@ export function createMemoryReplayAgent(
         recordMutation,
         onIncomplete,
         getRequestId: () => requestCapture?.currentRequestId,
+        omTape,
       });
     } else {
       const source = await options.sourceMemory();
@@ -327,6 +513,7 @@ export function createMemoryReplayAgent(
         ...selector,
         domain: source.domain,
         exclusiveAccess: source.exclusiveAccess,
+        sanitizeEvidence: sanitizer.replace,
         recordMutation,
         onIncomplete,
         getRequestId: () => requestCapture?.currentRequestId,
@@ -337,7 +524,11 @@ export function createMemoryReplayAgent(
           id: `kitaru-baseline-${invocationId}`,
           domains: { memory: binding.domain },
         }),
-        options: source.configuration,
+        options: await bindOMResultModels(
+          source.configuration,
+          options.resolveModel,
+          omTape,
+        ),
       });
       const initialSnapshot = await binding.captureInitial(source);
       let finished: Promise<void> | undefined;
@@ -347,27 +538,32 @@ export function createMemoryReplayAgent(
         initialSnapshot,
         finish() {
           finished ??= (async () => {
-            try {
-              await memory.settled();
-              await binding.drain();
-            } finally {
-              await binding.release();
-            }
+            await memory.settled();
+            await binding.drain();
           })();
           return finished;
         },
+        release: () => binding.release(),
       };
     }
+    markUnknownOnBinding = () =>
+      runtime.binding.markIncomplete(
+        "Recorded evidence contains an uncaptured credential URL or unsupported value.",
+      );
+    if (unsafeEvidenceReason) markUnknownOnBinding();
     try {
       const files = historical
         ? restoreCapturedFiles(historical.files)
-        : await createCapturedFiles(
-            options.files ?? [],
-            options.resolveFile ??
-              (async () => {
-                throw new Error("Missing controlled file resolver.");
-              }),
-          );
+        : baselineFiles;
+      if (!files)
+        throw new Error("Controlled file capture was not initialized.");
+      const evidenceClient = recordingClient(client, sanitizer.replace, () =>
+        unsafeEvidenceReason === "credential_url"
+          ? "credential_url_uncaptured"
+          : unsafeEvidenceReason === "unsupported_value"
+            ? "recorded_evidence_unsupported"
+            : undefined,
+      );
       const workspace = options.skillsDirectory
         ? await loadSkillsWorkspace(
             options.skillsDirectory,
@@ -421,14 +617,39 @@ export function createMemoryReplayAgent(
           ? await config.defaultOptions(dynamic)
           : (config.defaultOptions ?? {});
       const defaults = requireRecord(resolvedDefaults, "default options");
-      // Dynamic resolvers receive the mutable context that native Mastra uses.
-      const effectiveContext = requireRecord(
-        decodeMemoryValue(
-          encodeMemoryValue(Object.fromEntries(requestContext.entries())),
-        ),
-        "request context",
-      );
-      validateMemoryReplayContext(selector, effectiveContext);
+      // Baseline resolvers receive the original mutable context. Only the
+      // application's approved projection enters replay evidence.
+      const projectedContext = historical
+        ? Object.fromEntries(requestContext.entries())
+        : (options.captureRequestContext?.(requestContext) ?? {});
+      let effectiveContext: Record<string, unknown>;
+      try {
+        effectiveContext = requireRecord(
+          decodeMemoryValue(encodeMemoryValue(projectedContext)),
+          "request context",
+        );
+        validateMemoryReplayContext(selector, effectiveContext);
+      } catch {
+        throw new MemoryReplayContextError(
+          "Request context cannot be captured for memory replay.",
+        );
+      }
+      if (
+        Object.keys(effectiveContext).some((key) =>
+          /auth|credential|jwt|key|password|secret|token/i.test(key),
+        )
+      )
+        throw new MemoryReplayContextError(
+          "Unsupported replay request context credential key.",
+        );
+      if (
+        !historical &&
+        !options.captureRequestContext &&
+        [...requestContext.entries()].length > 0
+      )
+        runtime.binding.markIncomplete(
+          "Request context was not captured safely.",
+        );
       const { deepMerge } = await import("@mastra/core/utils");
       const callerData = { ...callerOptions };
       delete callerData.requestContext;
@@ -447,7 +668,7 @@ export function createMemoryReplayAgent(
         effectiveSelector.threadId !== selector.threadId ||
         effectiveSelector.resourceId !== selector.resourceId
       )
-        throw new Error(
+        throw new MemoryReplayContextError(
           "Invocation memory selectors differ from the captured selectors.",
         );
       if (record(effective.memory) && effective.memory.options !== undefined)
@@ -474,9 +695,16 @@ export function createMemoryReplayAgent(
           serializeMemoryConfiguration(runtime.memory.getMergedThreadConfig()),
         ...(workspace ? { workspaceManifest: workspace.manifest } : {}),
       };
+      let recordedRawInput = invocationInput;
+      if (!historical) {
+        if (!baselineFiles)
+          throw new Error("Controlled file capture was not initialized.");
+        recordedRawInput =
+          baselineFiles.replaceDeclaredFileUrls(invocationInput);
+      }
       const envelope = createMemoryReplayEnvelope({
         invocationId,
-        rawInput: invocationInput,
+        rawInput: recordedRawInput,
         initialSnapshot: runtime.initialSnapshot as MastraMemorySnapshot,
         configuration,
         requestContext: effectiveContext,
@@ -502,6 +730,7 @@ export function createMemoryReplayAgent(
         });
       const capture = createRequestCapture({
         invocationId,
+        sanitizeEvidence: sanitizer.replace,
         getMemoryRevision: () => runtime.binding.revision,
         onFailedAttempt: writeAttempt,
         onCaptureError: () =>
@@ -513,15 +742,40 @@ export function createMemoryReplayAgent(
       const policy = createStatefulToolProcessors({
         tokens: owned.tokens,
         getState,
+        sanitizeEvidence: sanitizer.replace,
         abort(reason) {
           state?.storeFailure(reason);
           abort.abort(reason);
         },
         adapter: options,
       });
+      const contextAtCapture = new Map(requestContext.entries());
       const requestProcessor: InputProcessor = {
         id: "kitaru-effective-request",
         async processInputStep(args) {
+          const currentContext =
+            args.requestContext instanceof RequestContext
+              ? args.requestContext
+              : requestContext;
+          const current = new Map(
+            [...currentContext.entries()].filter(
+              ([key]) => key !== "MastraMemory",
+            ),
+          );
+          if (
+            current.size !== contextAtCapture.size ||
+            [...current].some(
+              ([key, value]) => !Object.is(contextAtCapture.get(key), value),
+            )
+          ) {
+            runtime.binding.markIncomplete(
+              "Request context changed after replay capture.",
+            );
+            if (historical)
+              throw new Error(
+                "Unsupported Mastra memory replay: request context changed after capture.",
+              );
+          }
           capture.beginStep({
             stepNumber: args.stepNumber,
             messageList: args.messageList,
@@ -557,7 +811,12 @@ export function createMemoryReplayAgent(
         onError: callerOptions.onError,
         onAbort: callerOptions.onAbort,
         onStepFinish: callerOptions.onStepFinish,
-        requestContext,
+        // An empty adapter-created context changes Mastra's native stream lifecycle.
+        ...(historical ||
+        callerOptions.requestContext ||
+        [...requestContext.entries()].length > 0
+          ? { requestContext }
+          : {}),
         abortSignal: callerOptions.abortSignal
           ? AbortSignal.any([callerOptions.abortSignal, abort.signal])
           : abort.signal,
@@ -565,6 +824,7 @@ export function createMemoryReplayAgent(
       const version = createRequire(import.meta.url)("../package.json") as {
         version: string;
       };
+      markRecordingStreamEntered();
       return await streamWithRecording({
         adapterVersion: version.version,
         agent: agent as unknown as Parameters<
@@ -572,16 +832,27 @@ export function createMemoryReplayAgent(
         >[0]["agent"],
         callerMessages: invocationInput,
         callerOptions: runtimeOptions,
-        client,
+        client: evidenceClient,
         options,
         replayInput: replay.effectiveInput,
         replay,
+        nativeFallback: async (error) => {
+          try {
+            await runtime.finish();
+            await runtime.release();
+          } catch (cleanupError) {
+            reportLocalRecordingError(cleanupError);
+          }
+          reportLocalRecordingError(error);
+          return runNativeBaseline(rawInput, callerOptions);
+        },
         requestedModelId:
           replay.replacementModelId ?? String(configuration.modelId),
         sessionName: options.sessionName,
         startedAt,
         stateful: {
           input: { [MEMORY_REPLAY_KEY]: envelope },
+          sanitizeEvidence: sanitizer.replace,
           initialize(value) {
             state = value;
           },
@@ -596,6 +867,21 @@ export function createMemoryReplayAgent(
           async finish() {
             await runtime.finish();
             await capture.drain();
+            if (!historical) await runtime.binding.verifyEligibility();
+            const omResults = await omTape.finish();
+            for (const reason of omCaptureErrors)
+              runtime.binding.markIncomplete(reason);
+            if (omMismatches.length)
+              await writeNode({
+                external_id: `${invocationId}:om-input-mismatch`,
+                parent_external_id: ROOT_NODE_EXTERNAL_ID,
+                node_type: "span",
+                name: "om_input_mismatch",
+                status: "completed",
+                inputs: null,
+                outputs: null,
+                attributes: { count: omMismatches.length },
+              });
             for (const pending of capture.flushUnfinished())
               await writeAttempt(
                 pending,
@@ -603,20 +889,42 @@ export function createMemoryReplayAgent(
               );
             if (runtime.binding.incompleteReasons.length) {
               const message = runtime.binding.incompleteReasons.join(" ");
-              if (
-                runtime.binding.incompleteReasons.includes(
-                  "Native memory storage mutation failed.",
-                )
+              const reasonCode = runtime.binding.incompleteReasons.includes(
+                "Native memory storage mutation failed.",
               )
-                throw new Error(message);
-              throw new StatefulRecordingError(message);
+                ? "memory_mutation_failed"
+                : runtime.binding.incompleteReasons.includes(
+                      "Request context changed after replay capture.",
+                    )
+                  ? "context_mutated_after_capture"
+                  : "memory_evidence_incomplete";
+              throw new StatefulRecordingError(message, reasonCode);
             }
+            if (!envelope.complete)
+              throw new StatefulRecordingError(
+                envelope.reasons.join(" "),
+                "capture_prerequisite_failed",
+              );
+            return {
+              [MEMORY_REPLAY_KEY]: finalizeMemoryReplayEnvelope(
+                envelope,
+                omResults.map((entry) => ({
+                  phase: entry.phase,
+                  ordinal: entry.ordinal,
+                  method: entry.method,
+                  inputFingerprint: entry.inputFingerprint,
+                  output: entry.output,
+                })),
+              ),
+            };
           },
+          release: () => runtime.release(),
         },
       });
     } catch (error) {
       try {
         await runtime.finish();
+        await runtime.release();
       } catch (cleanupError) {
         if (options.onRecordingError) {
           void Promise.resolve()
@@ -635,6 +943,35 @@ export function createMemoryReplayAgent(
         }
       }
       throw error;
+    }
+  }
+  async function stream(
+    rawInput: unknown,
+    callerOptions: RuntimeStreamOptions = {},
+  ): Promise<unknown> {
+    let enteredRecordingStream = false;
+    try {
+      return await recordedStream(rawInput, callerOptions, () => {
+        enteredRecordingStream = true;
+      });
+    } catch (error) {
+      if (
+        enteredRecordingStream ||
+        process.env.KITARU_REPLAY_ID ||
+        process.env.KITARU_TASK_INPUTS ||
+        process.env.KITARU_OVERRIDE
+      )
+        throw error;
+      const reasonCode =
+        error instanceof Error &&
+        /requires @mastra\/(?:core|memory)@/.test(error.message)
+          ? "version_mismatch"
+          : error instanceof MemoryReplayContextError
+            ? "context_unsupported"
+            : "capture_setup_failed";
+      const nativeResult = await runNativeBaseline(rawInput, callerOptions);
+      void reportSetupFailure(error, reasonCode);
+      return nativeResult;
     }
   }
   return { stream: stream as Agent["stream"] };

@@ -1,7 +1,9 @@
+import { Extractor } from "@mastra/memory";
 import { expect, it, vi } from "vitest";
 import {
   createMemoryCaptureBinding,
   createProcessLocalMemoryAccess,
+  type MastraMemoryLease,
 } from "../src/memory-binding.js";
 import {
   createMemoryRuntime,
@@ -71,6 +73,49 @@ it("rejects shared-thread overlap while allowing independent source threads", as
   await two.binding.release();
 });
 
+it("shows why separate process-local helpers cannot qualify for multi-server replay", async () => {
+  const first = createProcessLocalMemoryAccess();
+  const second = createProcessLocalMemoryAccess();
+  const selector = { threadId: THREAD, resourceId: RESOURCE };
+  const firstLease = await first.acquire(selector);
+  const secondLease = await second.acquire(selector);
+  expect(await firstLease.verifyEligibility()).toBe(true);
+  expect(await secondLease.verifyEligibility()).toBe(true);
+  await firstLease();
+  await secondLease();
+});
+
+it("poisons all threads when a native fallback cannot identify its selector", async () => {
+  const access = createProcessLocalMemoryAccess();
+  const first = await access.acquire({
+    threadId: "first",
+    resourceId: RESOURCE,
+  });
+  const second = await access.acquire({
+    threadId: "second",
+    resourceId: RESOURCE,
+  });
+  await access.markUnsafeWrite();
+  expect(await first.verifyEligibility()).toBe(false);
+  expect(await second.verifyEligibility()).toBe(false);
+  await expect(access.resetAfterQuiescence()).rejects.toThrow(/active/);
+  await first();
+  await second();
+  const later = await access.acquire({
+    threadId: "third",
+    resourceId: RESOURCE,
+  });
+  expect(await later.verifyEligibility()).toBe(false);
+  await later();
+  await access.resetAfterQuiescence();
+  const recovered = await access.acquire({
+    threadId: "third",
+    resourceId: RESOURCE,
+  });
+  expect(await recovered.verifyEligibility()).toBe(true);
+  await recovered();
+});
+
 it("preserves native mutation results despite evidence persistence failure", async () => {
   const { runtime, binding, recordMutation } = await fixture();
   await binding.captureInitial(runtime.memory);
@@ -103,6 +148,128 @@ it("invalidates the first recording when a conflicting invocation cannot get its
   expect(one.binding.incompleteReasons.join()).toMatch(/overlapping/);
   await one.binding.release();
   await two.binding.release();
+  const next = await fixture("next", access);
+  expect(await next.binding.captureInitial(next.runtime.memory)).toBeDefined();
+  await next.binding.release();
+});
+
+it("preserves a native write after lost ownership and blocks eligibility until quiescence reset", async () => {
+  const access = createProcessLocalMemoryAccess();
+  const first = await fixture("first", access);
+  const second = await fixture("second", access);
+  await first.binding.captureInitial(first.runtime.memory);
+  expect(
+    await second.binding.captureInitial(second.runtime.memory),
+  ).toBeUndefined();
+  const native = await first.binding.domain.updateThread({
+    id: THREAD,
+    title: "native write still succeeds",
+  });
+  expect(native.title).toBe("native write still succeeds");
+  await first.binding.verifyEligibility();
+  expect(first.binding.incompleteReasons.join()).toMatch(/ownership/);
+  await first.binding.release();
+  await second.binding.release();
+  const next = await fixture("after", access);
+  expect(
+    await next.binding.captureInitial(next.runtime.memory),
+  ).toBeUndefined();
+  await next.binding.release();
+  await access.resetAfterQuiescence({ threadId: THREAD, resourceId: RESOURCE });
+  const recovered = await fixture("recovered", access);
+  expect(
+    await recovered.binding.captureInitial(recovered.runtime.memory),
+  ).toBeDefined();
+  await recovered.binding.release();
+});
+
+it("keeps an untracked late write unsafe until an explicit quiescence reset", async () => {
+  const access = createProcessLocalMemoryAccess();
+  const first = await fixture("first", access);
+  await first.binding.captureInitial(first.runtime.memory);
+  await first.binding.release();
+  const native = await first.binding.domain.updateThread({
+    id: THREAD,
+    title: "late native write",
+  });
+  expect(native.title).toBe("late native write");
+  const next = await fixture("next", access);
+  expect(
+    await next.binding.captureInitial(next.runtime.memory),
+  ).toBeUndefined();
+  await next.binding.release();
+  await access.resetAfterQuiescence({ threadId: THREAD, resourceId: RESOURCE });
+  const recovered = await fixture("recovered", access);
+  expect(
+    await recovered.binding.captureInitial(recovered.runtime.memory),
+  ).toBeDefined();
+  await recovered.binding.release();
+});
+
+it("bounds a hung acquisition and releases a lease returned after cancellation", async () => {
+  const release = Object.assign(
+    vi.fn(async () => {}),
+    {
+      verifyEligibility: vi.fn(async () => true),
+    },
+  ) satisfies MastraMemoryLease;
+  let resolveAcquire: ((lease: MastraMemoryLease) => void) | undefined;
+  const acquire = vi.fn(
+    () =>
+      new Promise<MastraMemoryLease>((resolve) => {
+        resolveAcquire = resolve;
+      }),
+  );
+  const runtime = createMemoryRuntime();
+  await seedMemory(runtime);
+  const binding = createMemoryCaptureBinding({
+    invocationId: "timeout",
+    domain: runtime.domain,
+    threadId: THREAD,
+    resourceId: RESOURCE,
+    exclusiveAccess: {
+      acquire,
+      markUnsafeWrite: async () => {},
+      resetAfterQuiescence: async () => {},
+    },
+    recordMutation: async () => {},
+    leaseWaitMs: 20,
+  });
+  const start = Date.now();
+  expect(await binding.captureInitial(runtime.memory)).toBeUndefined();
+  expect(Date.now() - start).toBeLessThan(200);
+  required(resolveAcquire)(release);
+  await vi.waitFor(() => expect(release).toHaveBeenCalledOnce());
+  await binding.release();
+});
+
+it("bounds a stalled pre-turn source read without changing native storage", async () => {
+  const runtime = createMemoryRuntime();
+  await seedMemory(runtime);
+  const native = runtime.domain.updateThread.bind(runtime.domain);
+  const binding = createMemoryCaptureBinding({
+    invocationId: "stalled-read",
+    domain: runtime.domain,
+    threadId: THREAD,
+    resourceId: RESOURCE,
+    exclusiveAccess: createProcessLocalMemoryAccess(),
+    recordMutation: async () => {},
+    captureWaitMs: 20,
+  });
+  const read = vi.spyOn(runtime.domain, "listMessages").mockImplementation(
+    async () =>
+      new Promise<never>(() => {
+        /* A storage read that never settles. */
+      }),
+  );
+  const start = Date.now();
+  expect(await binding.captureInitial(runtime.memory)).toBeUndefined();
+  expect(Date.now() - start).toBeLessThan(200);
+  expect(binding.incompleteReasons.join()).toMatch(/capture timed out/i);
+  await binding.release();
+  read.mockRestore();
+  const updated = await native({ id: THREAD, title: "native still works" });
+  expect(updated.title).toBe("native still works");
 });
 
 it("does not return a coherent initial snapshot after overlap during capture", async () => {
@@ -135,7 +302,7 @@ it("serializes overlapping native mutations and preserves original storage error
     });
   const first = binding.domain.updateThread({ id: THREAD, title: "first" });
   const second = binding.domain.updateThread({ id: THREAD, title: "second" });
-  await Promise.resolve();
+  await vi.waitFor(() => expect(calls).toEqual(["first"]));
   expect(calls).toEqual(["first"]);
   required(unblock)();
   await Promise.all([first, second]);
@@ -197,6 +364,78 @@ it("records OM flags, buffers, config, activation and working memory with stable
       ([event]) => (event as { revision: number }).revision,
     ),
   ).toEqual([1, 2, 3, 4, 5, 6]);
+  await binding.release();
+});
+
+it("records first-turn OM initialization by model and built-in extractor identity", async () => {
+  const { runtime, binding, recordMutation } = await fixture();
+  await binding.captureInitial(runtime.memory);
+  const observer = runtime.observer.model;
+  const reflector = runtime.reflector.model;
+  const original = {
+    threadId: "first-turn-thread",
+    resourceId: RESOURCE,
+    scope: "thread" as const,
+    config: {
+      scope: "thread",
+      observation: {
+        model: observer,
+        extractors: [
+          new Extractor(
+            { name: "current-task", instructions: "Continue." },
+            true,
+          ),
+        ],
+      },
+      reflection: { model: reflector },
+    },
+  };
+  const native = await binding.domain.initializeObservationalMemory(original);
+  expect((native.config.observation as Record<string, unknown>).model).toBe(
+    observer,
+  );
+  await binding.drain();
+  expect(binding.incompleteReasons).toEqual([]);
+  const event = recordMutation.mock.calls[0]?.[0] as {
+    arguments: unknown[];
+    result: Record<string, unknown>;
+  };
+  expect(event.arguments).toMatchObject([
+    {
+      config: {
+        observation: {
+          model: "fixture/observer",
+          extractors: [{ mastraBuiltinExtractor: "current-task" }],
+        },
+        reflection: { model: "fixture/reflector" },
+      },
+    },
+  ]);
+  expect(event.result).toMatchObject({
+    config: { observation: { model: "fixture/observer" } },
+  });
+  await binding.release();
+});
+
+it("keeps custom OM extractor execution native while refusing incomplete replay evidence", async () => {
+  const { runtime, binding } = await fixture();
+  await binding.captureInitial(runtime.memory);
+  const native = await binding.domain.initializeObservationalMemory({
+    threadId: "custom-extractor-thread",
+    resourceId: RESOURCE,
+    scope: "thread",
+    config: {
+      observation: {
+        model: runtime.observer.model,
+        extractors: [
+          new Extractor({ name: "custom", instructions: "Extract a value." }),
+        ],
+      },
+      reflection: { model: runtime.reflector.model },
+    },
+  });
+  expect(native.threadId).toBe("custom-extractor-thread");
+  expect(binding.incompleteReasons.join()).toMatch(/arguments|result/);
   await binding.release();
 });
 

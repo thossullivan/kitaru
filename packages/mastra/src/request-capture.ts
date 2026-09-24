@@ -33,6 +33,7 @@ export interface RequestCaptureOptions {
     error: unknown,
   ) => void | Promise<void>;
   onCaptureError?: (error: unknown) => void;
+  sanitizeEvidence?: <T>(value: T) => T;
 }
 
 export interface RequestStepContext {
@@ -102,7 +103,9 @@ export function createRequestCapture(options: RequestCaptureOptions) {
     reasons: string[],
   ): JsonValue {
     try {
-      const encoded = encodeMemoryValue(value);
+      const encoded = encodeMemoryValue(
+        options.sanitizeEvidence ? options.sanitizeEvidence(value) : value,
+      );
       // Provider options can contain custom transport headers whose keys are
       // not recognizable credential names. Do not persist that transport bag.
       function containsTransport(current: JsonValue): boolean {
@@ -141,17 +144,38 @@ export function createRequestCapture(options: RequestCaptureOptions) {
     try {
       const list = step.messageList;
       const sources = list?.makeMessageSourceChecker();
+      const tagged = Object.entries(
+        list?.getPersisted.taggedSystemMessages ?? {},
+      ).flatMap(([tag, messages]) =>
+        messages.map((message) => ({ role: message.role, tag })),
+      );
+      const allSystems = list?.getSystemMessages() ?? [];
+      const systems = [
+        ...allSystems
+          .slice(0, allSystems.length - tagged.length)
+          .map((message) => ({ role: message.role, tag: undefined })),
+        ...tagged,
+      ];
       provenance = convert(
         {
-          applicationInstructions: step.applicationInstructions,
-          extraContext: step.extraContext,
-          systemMessages: list?.serializeForSpan().systemMessages ?? [],
+          version: 2,
+          ...(step.applicationInstructions === undefined
+            ? {}
+            : { applicationInstructionsRef: "effective_request.prompt" }),
+          ...(step.extraContext === undefined
+            ? {}
+            : { extraContextRef: "mastra_memory_replay.configuration" }),
+          systemMessages: systems.map((message, index) => ({
+            index,
+            tag: message.tag,
+            role: message.role,
+          })),
           messages:
-            list?.get.all.db().map((message) => ({
+            list?.get.all.db().map((message, index) => ({
+              index,
               id: message.id,
               source: sources?.getSource(message) ?? null,
               role: message.role,
-              content: message.content,
             })) ?? [],
         },
         "Prompt provenance",

@@ -16,6 +16,50 @@ async function recorder(client: AdapterClient): Promise<RunRecorder> {
 }
 
 describe("normalized run lifecycle", () => {
+  it("creates a pending recording with metadata atomically", async () => {
+    const client = fakeClient();
+    await RunRecorder.create({
+      adapterVersion: "test-adapter",
+      agentId: "018f0000-0000-7000-8000-000000000100",
+      client,
+      effectiveInput: { prompt: "hello" },
+      framework: "mastra",
+      metadata: { mastra_replay_state: "pending" },
+      requestedModelId: "requested-model",
+    });
+    expect(client.created[0]?.metadata).toEqual({
+      mastra_replay_state: "pending",
+    });
+  });
+
+  it("publishes final inputs and eligibility with completion", async () => {
+    const client = fakeClient();
+    const run = await recorder(client);
+    await run.initialize();
+    const finalInputs = {
+      mastra_memory_replay: { version: 3, complete: true },
+    };
+    await run.complete(
+      { text: "done" },
+      {
+        inputs: finalInputs,
+        metadata: {
+          mastra_replay_state: "eligible",
+          mastra_native_state: "completed",
+        },
+      },
+    );
+    expect(client.updates.at(-1)).toMatchObject({
+      inputs: finalInputs,
+      metadata: {
+        mastra_replay_state: "eligible",
+        mastra_native_state: "completed",
+      },
+      status: "completed",
+    });
+    expect(client.nodes.at(-1)?.nodes[0]?.inputs).toEqual(finalInputs);
+  });
+
   it("creates, records, and completes one run", async () => {
     const client = fakeClient();
     const run = await recorder(client);
@@ -315,6 +359,19 @@ describe("normalized run lifecycle", () => {
     expect(client.updates.at(-1)).toMatchObject({
       error: "node write failed",
       status: "failed",
+    });
+  });
+
+  it("persists an ineligible recording reason in its terminal update", async () => {
+    const client = fakeClient();
+    const run = await recorder(client);
+    await run.failRecording(new Error("capture failed"), {
+      mastra_replay_state: "ineligible",
+      mastra_replay_reason: "capture_incomplete",
+    });
+    expect(client.updates.at(-1)?.metadata).toEqual({
+      mastra_replay_state: "ineligible",
+      mastra_replay_reason: "capture_incomplete",
     });
   });
 

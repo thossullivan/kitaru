@@ -27,6 +27,7 @@ interface ToolHookOptions {
   configuredAfterToolCall?: ConfiguredAfterToolCall;
   configuredBeforeToolCall?: ConfiguredBeforeToolCall;
   limits?: RecordingLimits;
+  sanitizeEvidence?: <T>(value: T) => T;
   state: AdapterRunState;
 }
 
@@ -65,16 +66,27 @@ async function invokePassthroughBeforeHooks(
   configuredHook?: ConfiguredBeforeToolCall,
   callerHook?: ToolHooks["beforeToolCall"],
   limits?: RecordingLimits,
+  sanitizeEvidence?: <T>(value: T) => T,
 ): Promise<undefined | ToolBeforeHookResult<unknown>> {
   try {
     const configuredResult = await configuredHook?.(hookContext);
     if (isSkippedResult(configuredResult)) {
-      completeToolCall(state, callId, configuredResult.output, limits);
+      completeToolCall(
+        state,
+        callId,
+        sanitizeEvidence?.(configuredResult.output) ?? configuredResult.output,
+        limits,
+      );
       return configuredResult;
     }
     const callerResult = await callerHook?.(hookContext);
     if (isSkippedResult(callerResult)) {
-      completeToolCall(state, callId, callerResult.output, limits);
+      completeToolCall(
+        state,
+        callId,
+        sanitizeEvidence?.(callerResult.output) ?? callerResult.output,
+        limits,
+      );
       return callerResult;
     }
     return undefined;
@@ -91,6 +103,7 @@ export function createToolHooks(options: ToolHookOptions): ToolHooks {
     configuredAfterToolCall,
     configuredBeforeToolCall,
     limits,
+    sanitizeEvidence,
     state,
   } = options;
 
@@ -104,7 +117,7 @@ export function createToolHooks(options: ToolHookOptions): ToolHooks {
         }
         const callId = toolCallId(hookContext.context);
         const converted = boundedRecorderConversion(
-          hookContext.input,
+          sanitizeEvidence?.(hookContext.input) ?? hookContext.input,
           `tool '${hookContext.toolName}' input`,
           limits,
         );
@@ -113,7 +126,8 @@ export function createToolHooks(options: ToolHookOptions): ToolHooks {
             callId,
             inputs: converted.value,
             inputsLossy: converted.lossy,
-            originalInputs: hookContext.input,
+            originalInputs:
+              sanitizeEvidence?.(hookContext.input) ?? hookContext.input,
             toolName: hookContext.toolName,
           });
           if (decision.type !== "execute") {
@@ -137,6 +151,7 @@ export function createToolHooks(options: ToolHookOptions): ToolHooks {
           configuredBeforeToolCall,
           callerHooks?.beforeToolCall,
           limits,
+          sanitizeEvidence,
         );
       } catch (error) {
         abortReplay?.(error);
@@ -152,7 +167,12 @@ export function createToolHooks(options: ToolHookOptions): ToolHooks {
       if (hookContext.error !== undefined) {
         failToolCall(state, callId, hookContext.error);
       } else {
-        completeToolCall(state, callId, hookContext.output, limits);
+        completeToolCall(
+          state,
+          callId,
+          sanitizeEvidence?.(hookContext.output) ?? hookContext.output,
+          limits,
+        );
       }
 
       try {

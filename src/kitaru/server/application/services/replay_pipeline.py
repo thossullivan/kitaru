@@ -13,8 +13,11 @@
 #  permissions and limitations under the License.
 """Replay job and task composition, shared by standalone replays and run fan-out."""
 
+import re
 import uuid
 from collections.abc import Sequence
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from kitaru.api_models.v1.job import JobKind, JobStatus
 from kitaru.api_models.v1.replay import BaselineEvaluationMode
@@ -41,9 +44,74 @@ from kitaru.server.application.services.plugin_resolution import get_plugin_task
 from kitaru.server.domain.job import Job
 from kitaru.server.domain.replay import Replay
 from kitaru.server.domain.replay_config import ReplayConfig
-from kitaru.server.domain.session import Session
+from kitaru.server.domain.session import (
+    Session,
+    SessionReplayNotReady,
+    mastra_replay_uses_observational_memory,
+    mastra_replay_v3_complete,
+)
 from kitaru.server.domain.task import AgentTask, EvaluationTask, Task
 from kitaru.server.utils import hash_params
+
+
+def _record(value: Any) -> dict[str, Any] | None:
+    """Return a JSON object, if this value is one."""
+    return value if isinstance(value, dict) else None
+
+
+def _check_mastra_replay_ready(baseline: Session) -> None:
+    """Reject provisional or incomplete Mastra memory input before task creation."""
+    if baseline.framework != "mastra":
+        return
+    state = baseline.metadata.get("mastra_replay_state")
+    if state == "pending":
+        started = baseline.started_at or baseline.created
+        stale = started is not None and datetime.now(UTC) - started > timedelta(
+            minutes=30
+        )
+        raise SessionReplayNotReady(
+            baseline.id, "mastra_replay_abandoned" if stale else "mastra_replay_pending"
+        )
+    if state == "ineligible":
+        reason = baseline.metadata.get("mastra_replay_reason")
+        code = (
+            reason
+            if isinstance(reason, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", reason)
+            else "capture_incomplete"
+        )
+        raise SessionReplayNotReady(baseline.id, f"mastra_replay_{code}")
+    inputs = _record(baseline.inputs.value) if baseline.inputs is not None else None
+    envelope = _record(inputs.get("mastra_memory_replay")) if inputs else None
+    if envelope is None:
+        if state == "eligible":
+            raise SessionReplayNotReady(baseline.id, "mastra_replay_incomplete")
+        return  # Existing history-only Mastra recordings have no memory envelope.
+    if baseline.status.value == "in_progress" or envelope.get("complete") is not True:
+        raise SessionReplayNotReady(baseline.id, "mastra_replay_incomplete")
+    if envelope.get("version") == 3 and not mastra_replay_v3_complete(envelope):
+        raise SessionReplayNotReady(baseline.id, "mastra_replay_incomplete")
+    if mastra_replay_uses_observational_memory(envelope) and not isinstance(
+        envelope.get("omTape"), list
+    ):
+        raise SessionReplayNotReady(baseline.id, "mastra_replay_tape_missing")
+    if state == "eligible" and envelope.get("version") != 3:
+        raise SessionReplayNotReady(baseline.id, "mastra_replay_incomplete")
+
+
+async def validate_replay_baselines(
+    baselines: Sequence[Session], payload_store: PayloadStore
+) -> None:
+    """Resolve and validate memory replay inputs before replay side effects.
+
+    Args:
+        baselines: Sessions selected for replay.
+        payload_store: Store used to resolve offloaded session inputs.
+    """
+    await payload_store.resolve(
+        [baseline.inputs for baseline in baselines if baseline.inputs is not None]
+    )
+    for baseline in baselines:
+        _check_mastra_replay_ready(baseline)
 
 
 async def create_replay_pipelines(
@@ -96,9 +164,7 @@ async def create_replay_pipelines(
     if evaluate_baselines:
         for baseline in baselines:
             baseline.check_evaluate()
-    await payload_store.resolve(
-        [baseline.inputs for baseline in baselines if baseline.inputs is not None]
-    )
+    await validate_replay_baselines(baselines, payload_store)
     jobs = [Job(owner_id=actor.account.id, kind=JobKind.REPLAY) for _ in baselines]
     replays = [
         Replay(

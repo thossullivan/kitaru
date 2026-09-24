@@ -60,7 +60,10 @@ from kitaru.server.application.services.agent_version_resolution import (
 from kitaru.server.application.services.evaluator_resolution import (
     validate_evaluators,
 )
-from kitaru.server.application.services.replay_pipeline import create_replay_pipelines
+from kitaru.server.application.services.replay_pipeline import (
+    create_replay_pipelines,
+    validate_replay_baselines,
+)
 from kitaru.server.application.services.server_analytics import ServerAnalytics
 from kitaru.server.application.services.task_transitions import TaskTransitions
 from kitaru.server.domain.base import ValidationError
@@ -474,6 +477,7 @@ class ExperimentService:
         assert run_spec is not None
         config.check_capabilities(run_spec.runtime_capabilities)
         sessions = await self._resolve_cohort_version_sessions(cohort_version.id)
+        await validate_replay_baselines(sessions, self._payload_store)
 
         number = await self._experiment_runs.get_max_number(experiment_id) + 1
         run = ExperimentRun(

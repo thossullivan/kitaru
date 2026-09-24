@@ -12,6 +12,7 @@ import {
   type MastraMemorySnapshot,
   validateMemorySnapshot,
 } from "./memory-snapshot.js";
+import type { createOMResultTape } from "./om-result-tape.js";
 
 function record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -68,8 +69,12 @@ function checkConfiguration(config: Record<string, unknown>): void {
     const feature = config[key];
     if (feature === undefined || feature === false) continue;
     if (!record(feature))
-      unsupported(`${key} requires explicit thread-scoped configuration.`);
-    if (feature.enabled !== false && feature.scope !== "thread")
+      unsupported(`${key} requires thread-scoped configuration.`);
+    if (
+      feature.enabled !== false &&
+      feature.scope !== undefined &&
+      feature.scope !== "thread"
+    )
       unsupported(`${key} must use thread scope.`);
   }
 }
@@ -133,6 +138,42 @@ export async function restoreMemoryConfiguration(
   return copy as MemoryConfigInternal;
 }
 
+/** Bind each native OM phase to its own result tape without changing actor calls. */
+export async function bindOMResultModels(
+  config: MemoryConfigInternal,
+  resolveModel: (id: string) => Promise<MastraModelConfig> | MastraModelConfig,
+  tape: ReturnType<typeof createOMResultTape>,
+): Promise<MemoryConfigInternal> {
+  const om = config.observationalMemory;
+  if (!om || (record(om) && om.enabled === false)) return config;
+  const source = om === true ? {} : (om as Record<string, unknown>);
+  const top = source.model;
+  const bound: Record<string, unknown> = { ...source, scope: "thread" };
+  delete bound.model;
+  for (const [name, phase] of [
+    ["observation", "observer"],
+    ["reflection", "reflector"],
+  ] as const) {
+    const settings = record(source[name]) ? { ...source[name] } : {};
+    const other = source[name === "observation" ? "reflection" : "observation"];
+    const modelIdentity =
+      settings.model ?? top ?? (record(other) ? other.model : undefined);
+    if (modelIdentity === undefined)
+      unsupported(
+        "OM requires an explicit observer and reflector model identity.",
+      );
+    const model =
+      typeof modelIdentity === "string"
+        ? await resolveModel(modelIdentity)
+        : modelIdentity;
+    if (!record(model) || typeof model.doStream !== "function")
+      unsupported("OM model resolution did not return a stream-capable model.");
+    settings.model = tape.instrument(model, phase);
+    bound[name] = settings;
+  }
+  return { ...config, observationalMemory: bound } as MemoryConfigInternal;
+}
+
 export interface IsolatedMemoryReplayOptions {
   invocationId: string;
   initialSnapshot: MastraMemorySnapshot;
@@ -141,6 +182,7 @@ export interface IsolatedMemoryReplayOptions {
   recordMutation: MastraMemoryCaptureOptions["recordMutation"];
   getRequestId?: MastraMemoryCaptureOptions["getRequestId"];
   onIncomplete?: MastraMemoryCaptureOptions["onIncomplete"];
+  omTape?: ReturnType<typeof createOMResultTape>;
 }
 
 /** Restore historical state into a fresh store; no production store is accepted. */
@@ -152,10 +194,16 @@ export async function createIsolatedMemoryReplay(
   const snapshot = decodeMemoryValue(
     encodeMemoryValue(options.initialSnapshot),
   ) as MastraMemorySnapshot;
-  const configuration = await restoreMemoryConfiguration(
+  let configuration = await restoreMemoryConfiguration(
     options.configuration,
     options.resolveModel,
   );
+  if (options.omTape)
+    configuration = await bindOMResultModels(
+      configuration,
+      options.resolveModel,
+      options.omTape,
+    );
   const { Memory } = await import("@mastra/memory");
   const { InMemoryStore, MastraCompositeStore } = await import(
     "@mastra/core/storage"
@@ -213,6 +261,9 @@ export async function createIsolatedMemoryReplay(
           }
         })();
         return finished;
+      },
+      release(): Promise<void> {
+        return finished ?? Promise.resolve();
       },
     };
   } catch (error) {

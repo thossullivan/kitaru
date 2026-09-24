@@ -189,7 +189,9 @@ Import `createMemoryReplayAgent()` from `@zenml-io/kitaru-mastra/memory` when a 
 pnpm add @zenml-io/kitaru-mastra @mastra/core@1.67.0 @mastra/memory@1.30.0 zod
 ```
 
-The factory creates a fresh native agent for each invocation. For a baseline, it binds native memory to your source storage and records the starting state before recall. For a replay, it restores that state into a separate in-memory store. Native working-memory tools and observation/reflection jobs then evolve the isolated state as the model runs again. Replay never calls `sourceMemory()`.
+The factory creates a fresh native agent for each invocation. A baseline uses your source storage and records the starting state before recall, then records the observer and reflector model outputs produced during that invocation. Replay restores the starting state into a separate in-memory store, runs the actor again, and supplies those recorded outputs to native observational memory (OM). Working-memory tools and native OM storage updates therefore run against isolated state. Replay never calls `sourceMemory()` or makes fresh observer/reflector provider calls.
+
+Recorded OM outputs match by call order, phase (observer or reflector), and model method. A missing, extra, reordered, or unused call fails replay with `KITARU_REPLAY_DIVERGED:mastra_om_call_order`. Changed OM input alone does not fail replay: Kitaru reuses the recorded output and records an `om_input_mismatch` span. This lets you compare actor instruction/model changes with recorded OM results, but does not measure how a fresh observer or reflector would respond to the changed conversation.
 
 The following binding uses a process-local store. Supply your existing public memory storage domain and its complete configuration for a persistent application:
 
@@ -246,20 +248,43 @@ const output = await recorded.stream("My preference is green.", {
   context: [{ role: "system", content: "The customer is asking about preferences." }],
 });
 await output.consumeStream();
-await store.close();
+// Keep the application and source store alive while recording finalizes.
+// Inspect session eligibility before shutting down or starting a replay.
 ```
 
 Run this entrypoint with `KITARU_API_URL`, a Kitaru credential, an existing `KITARU_AGENT_ID`, and the model provider credential. Register the compiled command as the agent version's run specification to run it through a worker. The same command serves baseline and replay tasks; the worker supplies the recorded input and replay identity.
 
-All source-memory writers must participate in the same exclusive-access mechanism. The process-local helper is suitable only when every writer shares that instance in one process. Use a distributed implementation of `MastraExclusiveMemoryAccess` when other processes can write. Its `acquire()` method must hold access until the returned release function runs. `settled()` must join pending work on the source `Memory` instance; it is not a lock. Configure working and observational memory with `scope: "thread"`; resource-scoped state, semantic recall, automatic title generation, and per-call `memory.options` are outside this contract.
+### Source ownership and supported configuration
 
-Keep `memory.thread` and `memory.resource` equal to any reserved Mastra thread/resource IDs in `requestContext`; a mismatch is rejected before native execution. Use `captureRequestContext` to select safe values: native authentication tokens are rejected, and transport headers in recorded configuration make the replay envelope incomplete. Use `resolveModel` to reconstruct credential-bearing model instances for replay.
+All writers to a source thread must participate in the same `MastraExclusiveMemoryAccess` implementation. The process-local helper works only when every writer shares that instance in one process. Overlapping turns can continue natively, but their recordings become ineligible for replay. `settled()` joins pending work on the source `Memory` instance; it does not provide exclusive access.
 
-Dynamic `instructions`, `model`, and `defaultOptions` resolve once during baseline setup. Replay uses their recorded values instead of calling those resolvers again. `resolveModel` must resolve the recorded actor, observer, and reflector model identifiers as well as any allowed actor override. A `system_prompt` override replaces only application instructions and retains recorded extra system context. Model and model-setting overrides affect the actor; observation and reflection retain their recorded configuration. Raw-input `prompt` overrides are rejected; record a new baseline to change invocation input.
+A multi-process or multi-server deployment must supply a backend using shared atomic storage; Kitaru does not include a production distributed lease backend. `acquire()` returns a callable release function with `verifyEligibility()`. The backend must preserve ownership through the final eligible-session update, mark an overlapping or unowned write unsafe through `markUnsafeWrite()`, and retain unsafe state across process loss. Call `resetAfterQuiescence()` only after all possible stale writers have stopped. Coordination failure must prevent replay eligibility even when native writes continue. Validate these guarantees against your actual storage, deployment topology, and failure recovery before enabling production replay; the process-local example does not establish customer deployment readiness.
+
+Schema working memory requires explicit `scope: "thread"`. An observational-memory configuration object may omit `scope`, using Mastra's implicit thread scope, or set it to `"thread"`. Supply explicit observer/reflector model identities, either shared through `observationalMemory.model` or in the phase configuration. Resource-scoped state, semantic recall, automatic title generation, and per-call `memory.options` remain unsupported.
+
+Keep `memory.thread` and `memory.resource` consistent with reserved Mastra thread/resource IDs in `requestContext`. A mismatch cannot produce an eligible recording. Baseline callbacks receive the original live context. `captureRequestContext` selects only approved, replay-relevant JSON values; it does not remove values from the live context. Replay receives that recorded projection. A nonempty context without an explicit projection makes the recording ineligible. For example, return `{ locale: context.get("locale") }` when locale is the only value replay needs, or `{}` when none are needed.
+
+Never include authentication tokens, credentials, or signed URLs in the projection. Credential-like context keys are rejected, and transport headers in recorded configuration make the envelope incomplete. These checks cannot identify every secret hidden in an arbitrary string; choose recorded fields explicitly. Use `resolveModel` to reconstruct model instances from locally configured credentials.
+
+Dynamic `instructions`, `model`, and `defaultOptions` resolve during baseline setup; replay uses their recorded values. `resolveModel` must resolve the recorded actor, observer, and reflector model identifiers and any allowed actor override. OM identifiers must resolve to native stream-capable model objects, whose provider methods Kitaru intercepts to reuse recorded results during replay. A `system_prompt` override replaces only application instructions and retains recorded extra system context. Model and model-setting overrides affect the actor; observation and reflection retain their recorded configuration and outputs. Raw-input `prompt` overrides are rejected; record a new baseline to change invocation input.
+
+### Recording readiness
+
+Native output and replay readiness are separate. Consume the baseline stream normally. Once the actor finishes, Kitaru finalizes recording in the background: it joins native memory work, records OM results and memory evidence, verifies source ownership, and persists the final input. Keep the application and source storage alive until that finalization finishes. `consumeStream()` alone is not a recording-completion barrier for a baseline.
+
+Inspect the baseline session's metadata and status:
+
+- `mastra_replay_state: "pending"`: recording has not finalized; do not replay yet.
+- `mastra_replay_state: "eligible"`: the complete version-3 input and evidence were persisted for replay.
+- `mastra_replay_state: "ineligible"`: recording could not establish a complete, isolated baseline. Inspect `mastra_replay_reason` and `mastra_native_state` to distinguish recording failure from native execution failure, then record a new baseline after resolving the cause.
+
+Recording-only problems do not replace the baseline's native answer. Diagnostics use `KITARU_RECORDING_INCOMPLETE:<reason>`, such as `memory_mutation_failed`, `context_mutated_after_capture`, or `memory_evidence_incomplete`. A Kitaru outage can prevent even these diagnostics from being persisted; missing status updates are not evidence of successful recording. A pending baseline older than 30 minutes is reported as `mastra_replay_abandoned` when replay is requested; this does not cancel a native turn or release a source lease.
+
+The server rejects pending, ineligible, or incomplete memory baselines before scheduling a replay or experiment run. CLI and MCP conflict responses expose a safe `mastra_replay_*` reason. Do not retry a pending session by supplying provisional inputs yourself.
 
 ### Create and inspect a memory replay
 
-After the worker records a complete baseline, create a replay using an existing evaluator:
+The SDK, CLI, and native MCP server support this workflow without a frontend. First inspect the baseline with `kitaru session get <baseline-session-id> --output json` and wait for `metadata.mastra_replay_state` to become `eligible`. Then create a replay using an existing evaluator:
 
 ```bash
 kitaru replay create <baseline-session-id> \
@@ -273,7 +298,7 @@ kitaru session get <result-session-id> --output json
 kitaru session nodes <result-session-id> --include-payloads --output json
 ```
 
-Read `result_session_id` from the replay, check the session's final status, and inspect its model-request and memory-mutation nodes. `session nodes` returns one page; follow `page.next_cursor` with `--cursor` while `page.has_more` is true.
+Read `result_session_id` from the replay, check the session's final status, and inspect its model-request and memory-mutation nodes. `session nodes` returns one page; pass a non-null `page.next_cursor` back with `--cursor` until it is null.
 
 The Python SDK uses the same replay request. Given an authenticated `client`, a baseline UUID, and an existing evaluator:
 
@@ -305,9 +330,11 @@ Inspect the run with `kitaru_activity_read`: get `kind: "experiment_run"`, list 
 
 ### Files, skills, and processors
 
-Pass a static `inputProcessors` array in the factory configuration. File processors must use the factory's supplied `resolveFile`; declare every allowed URL in the adapter's `files` list and provide a baseline `resolveFile` that returns `{ bytes: Uint8Array, mediaType: string }`. Kitaru records those bytes and serves them from the recorded input during replay. An undeclared URL fails instead of fetching live content.
+Pass a static `inputProcessors` array in the factory configuration. File processors must use the factory's supplied `resolveFile`; declare every allowed URL in the adapter's `files` list and provide a baseline resolver returning `{ bytes: Uint8Array, mediaType: string }`.
 
-For skills, set `skillsDirectory` to the directory containing your skill folders and use the factory's supplied `workspace`. Kitaru reads skill files into an immutable native workspace and records their paths, sizes, and hashes. Deploy the same skill artifact with the replay command. Changed files, missing files, and symlinks are rejected before execution.
+Kitaru replaces declared file URLs, including signed URLs, with `kitaru-file://sha256/...` content references in recorded input and records the bytes and media type. Replay resolves these references from recorded content, verifies the hash, and does not fetch the original URL. A processor must pass the file reference from its current input to the injected resolver; do not close over the original signed URL. Undeclared URLs and missing or altered recorded content fail instead of falling back to a network request. Capture accepts at most 64 distinct file URLs and 16 MiB of file bytes in total, subject to the replay input limit below.
+
+For skills, set `skillsDirectory` to the directory containing your skill folders and use the factory's supplied `workspace`. Kitaru reads skill files into an immutable native workspace and records their paths, sizes, and hashes. Deploy the same skill artifact with the replay command. The skills tree is limited to 1 MiB of file content and 10,000 files/directories. Changed files, missing files, and symlinks are rejected before replay execution.
 
 The factory must use the supplied memory and workspace instances. Processors and tools are application code: their dependencies must use these supplied bindings for replay isolation. Kitaru does not sandbox arbitrary callbacks or prevent code from opening another database connection or making a network request. Workflows, subagents, provider-executed tools, approval/resume modes, dynamic tool inventories, `prepareStep`, output processors, and secondary structured-output models remain unsupported.
 
@@ -315,11 +342,13 @@ The factory must use the supplied memory and workspace instances. Processors and
 
 Native memory tools execute against the isolated replay store, including under `history` with `on_miss: "fail"`. External tools, including tools added by a processor, follow the replay tool policy. A tool named `updateWorkingMemory` does not acquire the native-memory exemption by name. Use history with a failing miss when external tools must not execute.
 
-Session inputs contain a version-2 `mastra_memory_replay` envelope with the raw invocation, initial thread/resource/messages, observational state and buffers, effective configuration, approved request context, and controlled file bytes. Dates, URLs, and binary values retain their types. Set `captureRequestContext` to select the context the run needs; never include credentials. Unsupported values, redaction, or exceeding the 1,048,576-character serialized payload bound make the input incomplete. Older history-only snapshots cannot recover this state and must be recorded again with the factory.
+Eligible session inputs contain a version-3 `mastra_memory_replay` envelope with the invocation, initial thread/resource/messages, observational state and buffers, effective configuration, approved request context, controlled file bytes, and ordered OM results (`omTape`). Supported dates and binary values retain their types; declared file URLs become content references. Older history-only snapshots cannot recover this state. OM recordings without recorded results must be recorded again with the factory.
+
+Inputs remain bounded and self-contained. Unsupported values, redaction, or exceeding the 16 MiB serialized UTF-8 JSON limit make a recording ineligible. The replay input also has a 200,000-item budget and maximum depth of 64. Each binary value is limited to 8 MiB before base64 encoding; encoded files and OM outputs consume the shared JSON budget. These larger bounds apply to the memory replay input, not to every ordinary recorded node. The adapter reads the full initial thread history; `lastMessages` does not make recording unbounded or restrict that snapshot to the actor's recall window. A pre-turn capture that has not finished after five seconds becomes ineligible so a stalled storage read does not indefinitely delay the native answer. Large documents or long threads may therefore require a smaller baseline.
 
 Unlike ordinary wrapper recording, this path records the effective actor prompt, tools, tool choice, and supported settings for each provider attempt, including failed retries. Request attributes include attempt identity, memory revision, source provenance, and evidence completeness. `memory_mutation` span nodes record ordered native storage changes and link them to the active actor attempt when one exists. This evidence describes the request sent at the adapter's model boundary, not a provider's internal processing.
 
-Consume the stream through completion so Kitaru can join native background memory work, flush evidence, release source access, and close the isolated replay store. Inspect the replay session's status and evidence completeness as well as native output: recording problems do not replace application output, and Mastra can settle a stream after a policy failure. Missing or incomplete initial state fails replay before model execution. A failed or incomplete recording is not proof that all evidence was saved.
+Consume replay streams through completion and inspect the replay session's final status and evidence completeness. Replay finalization waits for isolated memory work and closes its store. Mastra can settle a native stream after a policy failure, so native output alone does not establish replay success. Missing or incomplete starting state fails replay before model execution; a later OM call mismatch can fail after actor execution has begun. A failed or incomplete recording is not proof that all evidence was saved.
 
 ## Structured output
 

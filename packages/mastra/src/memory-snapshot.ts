@@ -9,11 +9,13 @@ import type {
   ObservationalMemoryRecord,
   StorageResourceType,
 } from "@mastra/core/storage";
-import { type JsonValue, toRecorderJson } from "@zenml-io/kitaru";
+import type { JsonValue } from "@zenml-io/kitaru";
 import {
-  MAX_RECORDED_PAYLOAD_CHARS,
-  recordedToolPayloadConversion,
+  MAX_MASTRA_REPLAY_ITEMS,
+  MAX_MASTRA_REPLAY_JSON_BYTES,
+  strictMastraReplayValue,
 } from "@zenml-io/kitaru/adapter";
+import { fileReference } from "./stateful-files.js";
 
 export const MEMORY_REPLAY_KEY = "mastra_memory_replay";
 const CODEC_KEY = "$mastra";
@@ -50,11 +52,12 @@ export interface MastraMemoryReplayInput {
   configuration: Record<string, unknown>;
   requestContext: Record<string, unknown>;
   files: MastraRecordedFile[];
+  omTape?: JsonValue[];
 }
 
 export interface MastraMemoryReplayEnvelope {
   [key: string]: JsonValue;
-  version: 2;
+  version: 3;
   complete: boolean;
   reasons: string[];
   invocationId: string;
@@ -63,6 +66,7 @@ export interface MastraMemoryReplayEnvelope {
   configuration: JsonValue;
   requestContext: JsonValue;
   files: MastraFileManifestEntry[];
+  omTape: JsonValue[];
 }
 
 class MemoryReplayError extends Error {}
@@ -79,16 +83,6 @@ function requireValue(condition: unknown, reason: string): asserts condition {
   if (!condition) throw unsupported(reason);
 }
 
-function checkBudget(value: JsonValue): void {
-  try {
-    toRecorderJson(value);
-  } catch {
-    throw unsupported(
-      "Memory value exceeds the replay JSON depth/item limits.",
-    );
-  }
-}
-
 function hash(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
@@ -99,8 +93,8 @@ function binary(bytes: Uint8Array): {
   sha256: string;
 } {
   requireValue(
-    bytes.byteLength <= MAX_RECORDED_PAYLOAD_CHARS,
-    "Binary content exceeds the replay payload limit.",
+    bytes.byteLength <= 8 * 1_048_576,
+    "Binary content exceeds maximum file bytes 8388608.",
   );
   return {
     base64: Buffer.from(bytes).toString("base64"),
@@ -115,6 +109,7 @@ function readBinary(value: Record<string, unknown>): Uint8Array {
       typeof value.length === "number" &&
       Number.isSafeInteger(value.length) &&
       value.length >= 0 &&
+      value.length <= 8 * 1_048_576 &&
       typeof value.sha256 === "string",
     "Malformed binary content.",
   );
@@ -130,15 +125,27 @@ function readBinary(value: Record<string, unknown>): Uint8Array {
 
 function validateUrl(value: string): URL {
   const url = new URL(value);
+  if (url.protocol === "kitaru-file:") {
+    requireValue(
+      /^kitaru-file:\/\/sha256\/[a-f0-9]{64}$/.test(value),
+      "Malformed captured file reference.",
+    );
+    return url;
+  }
   requireValue(
-    !url.username && !url.password,
+    (url.protocol === "https:" || url.protocol === "http:") &&
+      !url.username &&
+      !url.password,
     "URL credentials are not replayable.",
   );
-  const query = recordedToolPayloadConversion(
-    Object.fromEntries(url.searchParams),
-    "Mastra file URL",
+  requireValue(
+    ![...url.searchParams.keys()].some((key) =>
+      /(?:^|[-_])(?:api[-_]?key|authorization|cookie|password|secret|token|signature|credential|sig)$/i.test(
+        key,
+      ),
+    ),
+    "URL query credentials are not replayable.",
   );
-  requireValue(!query.lossy, "URL query credentials are not replayable.");
   return url;
 }
 
@@ -148,15 +155,15 @@ export function encodeMemoryValue(value: unknown): JsonValue {
   const active = new Set<object>();
   function visit(current: unknown, depth: number): JsonValue {
     requireValue(
-      ++items <= 10_000 && depth < 64,
-      "Memory value exceeds the replay depth/item limits.",
+      ++items <= MAX_MASTRA_REPLAY_ITEMS && depth < 64,
+      `Memory value exceeds maximum items ${MAX_MASTRA_REPLAY_ITEMS} or depth 64.`,
     );
     if (current === undefined) return { [CODEC_KEY]: "undefined" };
     if (current === null || typeof current === "boolean") return current;
     if (typeof current === "string") {
       requireValue(
-        current.length <= MAX_RECORDED_PAYLOAD_CHARS,
-        "Memory value exceeds the replay payload limit.",
+        current.length <= MAX_MASTRA_REPLAY_JSON_BYTES,
+        `Memory value exceeds maximum string length ${MAX_MASTRA_REPLAY_JSON_BYTES}.`,
       );
       return current;
     }
@@ -209,29 +216,12 @@ export function encodeMemoryValue(value: unknown): JsonValue {
     }
   }
   const encoded = visit(value, 0);
-  const converted = recordedToolPayloadConversion(
-    encoded,
-    "Mastra memory replay",
-  );
-  requireValue(
-    !converted.lossy,
-    "Memory content was altered by credential protection or replay payload bounds.",
-  );
-  checkBudget(converted.value);
-  return converted.value;
+  return strictMastraReplayValue(encoded);
 }
 
 /** Decode an already bounded value, rejecting ambiguous or damaged codec records. */
 export function decodeMemoryValue(value: JsonValue): unknown {
-  const converted = recordedToolPayloadConversion(
-    value,
-    "Mastra memory replay",
-  );
-  requireValue(
-    !converted.lossy,
-    "Memory content was altered by credential protection or replay payload bounds.",
-  );
-  checkBudget(converted.value);
+  const converted = strictMastraReplayValue(value);
   function visit(current: JsonValue): unknown {
     if (Array.isArray(current)) return current.map(visit);
     if (!isRecord(current)) return current;
@@ -264,7 +254,7 @@ export function decodeMemoryValue(value: JsonValue): unknown {
       ]),
     );
   }
-  return visit(converted.value);
+  return visit(converted);
 }
 
 /** Validate the complete native state before an isolated store receives any writes. */
@@ -448,20 +438,57 @@ function validateConfiguration(
     !containsTransport(configuration),
     "Replay configuration contains transport metadata.",
   );
-  const memory = configuration.memoryConfig ?? configuration.memory;
-  if (!isRecord(memory)) return;
-  requireValue(
-    memory.semanticRecall === undefined || memory.semanticRecall === false,
-    "Semantic recall is outside isolated memory replay scope.",
-  );
-  for (const key of ["workingMemory", "observationalMemory"]) {
-    const feature = memory[key];
-    if (isRecord(feature) && feature.enabled !== false)
-      requireValue(
-        feature.scope === "thread",
-        "Only explicitly thread-scoped memory is replayable.",
-      );
+  for (const memory of [configuration.memoryConfig, configuration.memory]) {
+    if (!isRecord(memory)) continue;
+    requireValue(
+      memory.semanticRecall === undefined || memory.semanticRecall === false,
+      "Semantic recall is outside isolated memory replay scope.",
+    );
+    for (const key of ["workingMemory", "observationalMemory"]) {
+      const feature = memory[key];
+      if (isRecord(feature) && feature.enabled !== false)
+        requireValue(
+          feature.scope === "thread" ||
+            (key === "observationalMemory" && feature.scope === undefined),
+          "Only thread-scoped memory is replayable.",
+        );
+    }
   }
+}
+
+function normalizeReplayConfiguration(
+  configuration: Record<string, unknown>,
+): Record<string, unknown> {
+  const normalized = { ...configuration };
+  for (const key of ["memoryConfig", "memory"]) {
+    const memory = normalized[key];
+    if (
+      !isRecord(memory) ||
+      !isRecord(memory.observationalMemory) ||
+      memory.observationalMemory.enabled === false ||
+      memory.observationalMemory.scope !== undefined
+    )
+      continue;
+    normalized[key] = {
+      ...memory,
+      observationalMemory: { ...memory.observationalMemory, scope: "thread" },
+    };
+  }
+  return normalized;
+}
+
+function usesObservationalMemory(
+  configuration: Record<string, unknown>,
+): boolean {
+  return [configuration.memoryConfig, configuration.memory].some((memory) => {
+    if (!isRecord(memory)) return false;
+    const feature = memory.observationalMemory;
+    return (
+      feature !== undefined &&
+      feature !== false &&
+      (!isRecord(feature) || feature.enabled !== false)
+    );
+  });
 }
 
 /** Require native context selectors to match the leased and captured memory. */
@@ -501,7 +528,7 @@ export function createMemoryReplayEnvelope(
   input: MastraMemoryReplayInput,
 ): MastraMemoryReplayEnvelope {
   const incomplete = (reason: string): MastraMemoryReplayEnvelope => ({
-    version: 2,
+    version: 3,
     complete: false,
     reasons: [reason],
     invocationId: "",
@@ -510,60 +537,73 @@ export function createMemoryReplayEnvelope(
     configuration: null,
     requestContext: null,
     files: [],
+    omTape: [],
   });
   try {
     validateMemorySnapshot(input.initialSnapshot);
     const envelope: MastraMemoryReplayEnvelope = {
-      version: 2,
+      version: 3,
       complete: true,
       reasons: [],
       invocationId: input.invocationId,
       rawInput: encodeMemoryValue(input.rawInput),
       initialSnapshot: encodeMemoryValue(input.initialSnapshot),
-      configuration: encodeMemoryValue(input.configuration),
+      configuration: encodeMemoryValue(
+        normalizeReplayConfiguration(input.configuration),
+      ),
       requestContext: encodeMemoryValue(input.requestContext),
       files: input.files.map((file) => ({
         url: file.url,
         mediaType: file.mediaType,
         ...binary(file.bytes),
       })),
+      omTape: input.omTape === undefined ? [] : input.omTape,
     };
     // The combined envelope, including encoded bytes and metadata, shares one budget.
-    const converted = recordedToolPayloadConversion(
+    const converted = strictMastraReplayValue(
       envelope,
       "Mastra memory replay envelope",
     );
-    requireValue(
-      !converted.lossy,
-      "Envelope exceeds replay limits or contains credentials.",
-    );
-    decodeMemoryReplayEnvelope(converted.value);
-    return converted.value as unknown as MastraMemoryReplayEnvelope;
+    decodeConvertedMemoryReplayEnvelope(converted);
+    return converted as MastraMemoryReplayEnvelope;
   } catch (error) {
     return incomplete(
       error instanceof MemoryReplayError
         ? error.message
-        : "Memory replay prerequisites could not be captured safely.",
+        : error instanceof Error && /exceeds maximum/.test(error.message)
+          ? error.message
+          : "Memory replay prerequisites could not be captured safely.",
     );
   }
+}
+
+/** Produce the immutable final envelope after recorded OM work has settled. */
+export function finalizeMemoryReplayEnvelope(
+  envelope: MastraMemoryReplayEnvelope,
+  omTape: JsonValue[],
+): MastraMemoryReplayEnvelope {
+  const final = strictMastraReplayValue(
+    { ...envelope, omTape },
+    "Mastra memory replay envelope",
+  ) as MastraMemoryReplayEnvelope;
+  decodeConvertedMemoryReplayEnvelope(final);
+  return final;
 }
 
 export function decodeMemoryReplayEnvelope(
   input: unknown,
 ): MastraMemoryReplayInput {
-  const converted = recordedToolPayloadConversion(
-    input,
-    "Mastra memory replay envelope",
-  );
-  requireValue(
-    !converted.lossy,
-    "Envelope exceeds replay limits or contains credentials.",
-  );
-  checkBudget(converted.value);
-  const value = converted.value;
+  const value = strictMastraReplayValue(input, "Mastra memory replay envelope");
+  return decodeConvertedMemoryReplayEnvelope(value);
+}
+
+/** Validate a value already copied through the strict replay codec. */
+function decodeConvertedMemoryReplayEnvelope(
+  value: JsonValue,
+): MastraMemoryReplayInput {
   requireValue(
     isRecord(value) &&
-      value.version === 2 &&
+      (value.version === 2 || value.version === 3) &&
       value.complete === true &&
       Array.isArray(value.reasons) &&
       value.reasons.length === 0 &&
@@ -571,6 +611,10 @@ export function decodeMemoryReplayEnvelope(
       value.invocationId.length > 0 &&
       Array.isArray(value.files),
     "Missing, incomplete, or unknown version of memory replay envelope.",
+  );
+  requireValue(
+    value.version === 2 || Array.isArray(value.omTape),
+    "Malformed recorded observational-memory tape.",
   );
   for (const key of [
     "rawInput",
@@ -586,6 +630,10 @@ export function decodeMemoryReplayEnvelope(
   validateMemorySnapshot(initialSnapshot);
   const configuration = decodeMemoryValue(value.configuration as JsonValue);
   validateConfiguration(configuration);
+  requireValue(
+    value.version !== 2 || !usesObservationalMemory(configuration),
+    "mastra_om_tape_missing",
+  );
   const requestContext = decodeMemoryValue(value.requestContext as JsonValue);
   requireValue(isRecord(requestContext), "Malformed recorded request context.");
   validateMemoryReplayContext(initialSnapshot, requestContext);
@@ -610,11 +658,18 @@ export function decodeMemoryReplayEnvelope(
       "Malformed or duplicate recorded file.",
     );
     validateUrl(file.url);
+    const bytes = readBinary(file);
+    if (value.version === 3)
+      requireValue(
+        /^kitaru-file:\/\/sha256\/[a-f0-9]{64}$/.test(file.url) &&
+          file.url === fileReference({ mediaType: file.mediaType, bytes }),
+        "Recorded file must use its captured content reference.",
+      );
     urls.add(file.url);
     return {
       url: file.url,
       mediaType: file.mediaType,
-      bytes: readBinary(file),
+      bytes,
     };
   });
   return {
@@ -624,6 +679,7 @@ export function decodeMemoryReplayEnvelope(
     configuration,
     requestContext,
     files,
+    ...(value.version === 3 ? { omTape: value.omTape as JsonValue[] } : {}),
   };
 }
 

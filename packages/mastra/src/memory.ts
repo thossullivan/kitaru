@@ -2,6 +2,8 @@ export type {
   MastraExclusiveMemoryAccess,
   MastraMemoryCaptureBinding,
   MastraMemoryCaptureOptions,
+  MastraMemoryLease,
+  MastraMemoryLeaseOptions,
   MastraMemoryMutation,
   MastraMemorySelector,
 } from "./memory-binding.js";

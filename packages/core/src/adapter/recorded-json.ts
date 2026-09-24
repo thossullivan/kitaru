@@ -8,6 +8,9 @@ const MAX_RECORDED_JSON_CHARS = 65_536;
 export const MAX_RECORDED_PAYLOAD_CHARS = 1_048_576;
 const MAX_RECORDED_PAYLOAD_ITEMS = 10_000;
 const MAX_RECORDED_PAYLOAD_DEPTH = 64;
+/** Mastra's captured memory can exceed generic recorder limits. */
+export const MAX_MASTRA_REPLAY_JSON_BYTES = 16 * 1_048_576;
+export const MAX_MASTRA_REPLAY_ITEMS = 200_000;
 // Leave room for the session node and step envelope in toRecorderJson's
 // 10,000-item ceiling after the tool value is embedded in it.
 const MAX_BOUNDED_TOOL_ITEMS = 9_000;
@@ -29,6 +32,17 @@ const SECRET_KEYS: ReadonlySet<string> = new Set([
   "secret",
   "token",
 ]);
+const MASTRA_REPLAY_SENSITIVE_KEYS: ReadonlySet<string> = new Set([
+  ...SECRET_KEYS,
+  "headers",
+  "abortsignal",
+]);
+
+function isSecretUrlQueryKey(key: string): boolean {
+  return /(?:^|[-_])(?:api[-_]?key|authorization|cookie|password|secret|token|signature|credential|sig)$/i.test(
+    key,
+  );
+}
 
 /**
  * Keys whose value is a blob, a transport envelope, or a framework context
@@ -112,6 +126,7 @@ interface CloneOptions {
   maxStringChars: number;
   path: string;
   rejectLongStrings: boolean;
+  rejectUrlCredentials?: boolean;
   sensitiveKeyMode: SensitiveKeyMode;
   sensitiveKeys: ReadonlySet<string>;
 }
@@ -128,6 +143,23 @@ function spendBudget(options: CloneOptions, characters: number): void {
 }
 
 function boundedString(value: string, options: CloneOptions): JsonValue {
+  if (options.rejectUrlCredentials) {
+    for (const match of value.matchAll(/https?:\/\/[^\s"'<>]+/gi)) {
+      let url: URL;
+      try {
+        url = new URL(match[0]);
+      } catch {
+        continue;
+      }
+      if (
+        url.username ||
+        url.password ||
+        [...url.searchParams.keys()].some(isSecretUrlQueryKey)
+      ) {
+        throw new TypeError(`${options.path} contains URL credentials`);
+      }
+    }
+  }
   if (value.length <= options.maxStringChars) {
     spendBudget(options, value.length);
     return value;
@@ -504,6 +536,99 @@ export function projectRecordedInput(
   });
   assertJsonSize(converted, path, MAX_RECORDED_PAYLOAD_CHARS);
   return converted;
+}
+
+/** Strict, independently bounded JSON for the Mastra historical read-set. */
+export function strictMastraReplayValue(
+  value: unknown,
+  path = "Mastra memory replay",
+): JsonValue {
+  const options: CloneOptions = {
+    budget: {
+      chars: MAX_MASTRA_REPLAY_JSON_BYTES * 2,
+      items: MAX_MASTRA_REPLAY_ITEMS,
+    },
+    lossy: false,
+    maxDepth: MAX_RECORDED_PAYLOAD_DEPTH,
+    maxItems: MAX_MASTRA_REPLAY_ITEMS,
+    maxStringChars: MAX_MASTRA_REPLAY_JSON_BYTES,
+    path,
+    rejectLongStrings: true,
+    rejectUrlCredentials: true,
+    sensitiveKeyMode: "reject",
+    sensitiveKeys: MASTRA_REPLAY_SENSITIVE_KEYS,
+  };
+  let converted: JsonValue;
+  try {
+    converted = convert(value, options);
+  } catch (error) {
+    if (
+      error instanceof TypeError &&
+      /recorded item count|maximum array length|maximum object size/.test(
+        error.message,
+      )
+    )
+      throw new TypeError(
+        `${path} exceeds maximum item count ${MAX_MASTRA_REPLAY_ITEMS}`,
+      );
+    if (error instanceof TypeError && /recorded JSON size/.test(error.message))
+      throw new TypeError(
+        `${path} exceeds maximum JSON bytes ${MAX_MASTRA_REPLAY_JSON_BYTES}`,
+      );
+    throw error;
+  }
+  if (options.lossy) throw new TypeError(`${path} contains unsupported values`);
+  if (
+    Buffer.byteLength(JSON.stringify(converted), "utf8") >
+    MAX_MASTRA_REPLAY_JSON_BYTES
+  )
+    throw new TypeError(
+      `${path} exceeds maximum JSON bytes ${MAX_MASTRA_REPLAY_JSON_BYTES}`,
+    );
+  return converted;
+}
+
+/** Require a real version-3 envelope before using the larger Mastra bound. */
+export function projectMastraReplayInput(value: unknown): JsonValue {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    !isPlainObject(value) ||
+    !Object.hasOwn(value, "mastra_memory_replay") ||
+    Object.keys(value).some(
+      (key) =>
+        !["mastra_memory_replay", "system_prompt", "prompt"].includes(key),
+    )
+  )
+    throw new TypeError("Mastra replay input requires a version-3 envelope");
+  const envelope = (value as Record<string, unknown>).mastra_memory_replay;
+  if (
+    typeof envelope !== "object" ||
+    envelope === null ||
+    !isPlainObject(envelope)
+  )
+    throw new TypeError(
+      "Mastra replay input requires a complete version-3 envelope",
+    );
+  const fields = envelope as Record<string, unknown>;
+  if (
+    fields.version !== 3 ||
+    fields.complete !== true ||
+    !Array.isArray(fields.reasons) ||
+    fields.reasons.length !== 0 ||
+    typeof fields.invocationId !== "string" ||
+    fields.invocationId.length === 0 ||
+    !Object.hasOwn(fields, "rawInput") ||
+    !Object.hasOwn(fields, "initialSnapshot") ||
+    !Object.hasOwn(fields, "configuration") ||
+    !Object.hasOwn(fields, "requestContext") ||
+    !Array.isArray(fields.files) ||
+    !Array.isArray(fields.omTape)
+  )
+    throw new TypeError(
+      "Mastra replay input requires a complete version-3 envelope",
+    );
+  return strictMastraReplayValue(value, "Mastra replay input");
 }
 
 /**

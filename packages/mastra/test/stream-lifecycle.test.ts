@@ -749,6 +749,37 @@ describe("stream recording lifecycle", () => {
     await vi.waitFor(() => expect(reported).toHaveBeenCalledTimes(1));
   });
 
+  it("keeps a native provider error ahead of a simultaneous recording failure", async () => {
+    const api = installTestApi();
+    let nodeWrites = 0;
+    wrapFetch(({ method, path }) => {
+      if (method === "POST" && path.endsWith("/nodes")) {
+        nodeWrites += 1;
+        return nodeWrites === 2;
+      }
+      return false;
+    });
+    const nativeError = new Error("native provider failed");
+    const agent = Object.assign(new FakeAgent(), {
+      async stream(_messages: unknown, options: RuntimeStreamOptions = {}) {
+        await options.onStepFinish?.(textStep("before-provider-failure"));
+        throw nativeError;
+      },
+    });
+    const recorded = new KitaruAgent(agent, {
+      agentId: AGENT_ID,
+      apiUrl: "https://api.example",
+      requestedModelId: "provider-error-model",
+    });
+
+    await expect(recorded.stream("hello")).rejects.toBe(nativeError);
+    expect(api.calls.at(-1)?.body).toMatchObject({
+      error:
+        "Mastra stream failed; KITARU_RECORDING_INCOMPLETE:recording_step_failed",
+      status: "failed",
+    });
+  });
+
   it("reports a step write rejected after terminal completion", async () => {
     installTestApi();
     enforceTerminalSessionTransitions();

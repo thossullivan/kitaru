@@ -46,6 +46,7 @@ export function createStatefulToolProcessors(options: {
   getState(): AdapterRunState;
   abort(reason: unknown): void;
   adapter: KitaruAgentOptions;
+  sanitizeEvidence?: <T>(value: T) => T;
 }) {
   const trusted = new WeakSet<(...args: never[]) => unknown>();
   const wrappersByName = new Map<
@@ -55,12 +56,9 @@ export function createStatefulToolProcessors(options: {
       (...args: unknown[]) => Promise<unknown>
     >
   >();
-  let inspected = false;
   const first: InputProcessor = {
     id: "kitaru-memory-tool-identity",
     processInputStep({ tools }) {
-      if (inspected) return;
-      inspected = true;
       for (const tool of Object.values(tools ?? {})) {
         if (
           record(tool) &&
@@ -105,6 +103,7 @@ export function createStatefulToolProcessors(options: {
             configuredBeforeToolCall: options.adapter.configuredBeforeToolCall,
             configuredAfterToolCall: options.adapter.configuredAfterToolCall,
             limits: options.adapter.recordingLimits,
+            sanitizeEvidence: options.sanitizeEvidence,
           });
           wrapper = async (input: unknown, context: unknown) => {
             const event = { toolName: name, input, context, metadata: {} };

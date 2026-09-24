@@ -123,11 +123,15 @@ function usageTokens(usage: unknown): SessionNodeCreateRequest["tokens"] {
 function stepOutputs(
   step: RecordedStep,
   tools: readonly NormalizedToolCall[],
+  sanitizeEvidence?: <T>(value: T) => T,
 ): JsonValue {
   return boundedRecorderJson(
     {
       finish_reason: step.finishReason ?? null,
-      text: boundedRecorderJson(step.text, "model step text"),
+      text: boundedRecorderJson(
+        sanitizeEvidence?.(step.text) ?? step.text,
+        "model step text",
+      ),
       tool_calls: tools.map((tool) => ({
         args: tool.inputs,
         toolCallId: tool.callId,
@@ -147,7 +151,10 @@ function stepOutputs(
             ],
       ),
       tripwire: projectRecordedMetadata(step.tripwire),
-      warnings: boundedRecorderJson(step.warnings, "model warnings"),
+      warnings: boundedRecorderJson(
+        sanitizeEvidence?.(step.warnings) ?? step.warnings,
+        "model warnings",
+      ),
     },
     "model step output",
   );
@@ -178,6 +185,7 @@ export async function recordStep(
   costCalculator?: KitaruCostCalculator,
   limits?: RecordingLimits,
   requestEvidence?: RequestEvidence,
+  sanitizeEvidence?: <T>(value: T) => T,
 ): Promise<void> {
   const calls = step.toolCalls.flatMap((item) => {
     const call = toolCallPayload(item);
@@ -192,13 +200,13 @@ export async function recordStep(
   const tools: NormalizedToolCall[] = calls.map((call) => {
     const result = results.get(call.toolCallId);
     const inputs = boundedRecorderConversion(
-      call.args,
+      sanitizeEvidence?.(call.args) ?? call.args,
       `tool '${call.toolName}' input`,
       limits,
     );
     const recordedResult = result
       ? boundedRecorderConversion(
-          result.result,
+          sanitizeEvidence?.(result.result) ?? result.result,
           `tool '${call.toolName}' output`,
           limits,
         )
@@ -257,7 +265,7 @@ export async function recordStep(
     model: servedModelId,
     modelSettings: requestEvidence?.modelSettings,
     startedAt: requestEvidence?.startedAt,
-    outputs: stepOutputs(step, tools),
+    outputs: stepOutputs(step, tools, sanitizeEvidence),
     provider,
     tokens,
     tools,

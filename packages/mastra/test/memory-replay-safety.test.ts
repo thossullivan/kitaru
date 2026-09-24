@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+import { Agent } from "@mastra/core/agent";
 import {
   MASTRA_AUTH_TOKEN_KEY,
   MASTRA_RESOURCE_ID_KEY,
@@ -48,6 +50,49 @@ function input(): MastraMemoryReplayInput {
     files: [],
   };
 }
+
+it("stores captured file references and refuses signed source URLs", () => {
+  const bytes = new Uint8Array([1, 2, 3]);
+  const digest = createHash("sha256")
+    .update("image/png")
+    .update("\0")
+    .update(bytes)
+    .digest("hex");
+  const ref = `kitaru-file://sha256/${digest}`;
+  const safe = input();
+  safe.rawInput = { file: new URL(ref) };
+  safe.files = [{ url: ref, mediaType: "image/png", bytes }];
+  const envelope = createMemoryReplayEnvelope(safe);
+  expect(envelope.complete, envelope.reasons.join("; ")).toBe(true);
+  expect(decodeMemoryReplayEnvelope(envelope).files[0]?.bytes).toEqual(bytes);
+
+  const plain = createMemoryReplayEnvelope({
+    ...safe,
+    files: [
+      { url: "https://files.invalid/image.png", mediaType: "image/png", bytes },
+    ],
+  });
+  expect(plain.complete).toBe(false);
+
+  const signed = createMemoryReplayEnvelope({
+    ...safe,
+    rawInput: {
+      file: "https://files.invalid/image.png?X-Amz-Signature=SECRET",
+    },
+  });
+  expect(signed.complete).toBe(false);
+  expect(JSON.stringify(signed)).not.toContain("SECRET");
+
+  const captured = envelope.files[0];
+  if (!captured) throw new Error("Missing captured file");
+  const altered = {
+    ...envelope,
+    files: [{ ...captured, url: `kitaru-file://sha256/${"0".repeat(64)}` }],
+  };
+  expect(() => decodeMemoryReplayEnvelope(altered)).toThrow(
+    /captured content reference/,
+  );
+});
 
 function fixture(
   factory?: MemoryReplayAgentFactory,
@@ -113,7 +158,7 @@ it.each(["defaultOptions", "runOptions", "memoryConfig"])(
         ...clean,
         configuration: { ...original.configuration, [key]: unsafe },
       }),
-    ).toThrow(/transport/i);
+    ).toThrow(/transport|sensitive key/i);
   },
 );
 
@@ -129,55 +174,80 @@ it("rejects native auth tokens during capture and decode", () => {
   ).toThrow(/auth/i);
 });
 
-it("rejects default auth-token context capture before recording or execution", async () => {
+it("keeps native auth context while marking uncaptured context ineligible", async () => {
   const api = installTestApi();
   const { adapter, modelCall } = fixture();
   const requestContext = new RequestContext();
   requestContext.set(MASTRA_AUTH_TOKEN_KEY, "CREDENTIAL");
-  await expect(
-    adapter.stream("hello", {
-      memory: { thread: "thread", resource: "resource" },
-      requestContext,
-    }),
-  ).rejects.toThrow(/auth/i);
-  expect(modelCall).not.toHaveBeenCalled();
-  expect(api.calls).toEqual([]);
+  const result = await adapter.stream("hello", {
+    memory: { thread: "thread", resource: "resource" },
+    requestContext,
+  });
+  await result.consumeStream();
+  expect(await result.text).toBe("done");
+  expect(modelCall).toHaveBeenCalledTimes(1);
+  await vi.waitFor(() =>
+    expect(
+      api.calls.find(
+        (call) => call.method === "PATCH" && call.body?.status === "failed",
+      )?.body?.metadata,
+    ).toMatchObject({ mastra_replay_state: "ineligible" }),
+  );
+  expect(JSON.stringify(api.calls)).not.toContain("CREDENTIAL");
 });
 
 it.each([MASTRA_THREAD_ID_KEY, MASTRA_RESOURCE_ID_KEY])(
-  "rejects a mismatched %s before acquiring the source lease",
+  "keeps a mismatched %s native and rejects its recording before leasing",
   async (key) => {
     const api = installTestApi();
     const { adapter, modelCall, acquire } = fixture();
     const requestContext = new RequestContext();
     requestContext.set(key, "other");
-    await expect(
-      adapter.stream("hello", {
-        memory: { thread: "thread", resource: "resource" },
-        requestContext,
-      }),
-    ).rejects.toThrow(/selector/i);
+    const result = await adapter.stream("hello", {
+      memory: { thread: "thread", resource: "resource" },
+      requestContext,
+    });
+    await result.consumeStream();
+    expect(await result.text).toBe("done");
     expect(acquire).not.toHaveBeenCalled();
-    expect(modelCall).not.toHaveBeenCalled();
-    expect(api.calls).toEqual([]);
+    expect(modelCall).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() =>
+      expect(
+        api.calls.find(
+          (call) => call.method === "POST" && call.path === "/api/v1/sessions",
+        )?.body?.metadata,
+      ).toMatchObject({
+        mastra_replay_state: "ineligible",
+        mastra_replay_reason: "context_unsupported",
+      }),
+    );
   },
 );
 
-it("does not let selective context capture bypass middleware memory selectors", async () => {
+it("does not make mismatched middleware selectors replayable through selective capture", async () => {
   const api = installTestApi();
   const { adapter, acquire } = fixture(undefined, {
     captureRequestContext: () => ({ locale: "en" }),
   });
   const requestContext = new RequestContext();
   requestContext.set(MASTRA_THREAD_ID_KEY, "authorized-thread");
-  await expect(
-    adapter.stream("hello", {
-      memory: { thread: "thread", resource: "resource" },
-      requestContext,
-    }),
-  ).rejects.toThrow(/selector/i);
+  const result = await adapter.stream("hello", {
+    memory: { thread: "thread", resource: "resource" },
+    requestContext,
+  });
+  await result.consumeStream();
+  expect(await result.text).toBe("done");
   expect(acquire).not.toHaveBeenCalled();
-  expect(api.calls).toEqual([]);
+  await vi.waitFor(() =>
+    expect(
+      api.calls.find(
+        (call) => call.method === "POST" && call.path === "/api/v1/sessions",
+      )?.body?.metadata,
+    ).toMatchObject({
+      mastra_replay_state: "ineligible",
+      mastra_replay_reason: "context_unsupported",
+    }),
+  );
 });
 
 it("allows selective capture to exclude live authentication tokens", async () => {
@@ -193,14 +263,23 @@ it("allows selective capture to exclude live authentication tokens", async () =>
   });
   await result.consumeStream();
   expect(JSON.stringify(api.calls)).not.toContain("CREDENTIAL");
-  expect(
-    api.calls.filter((call) => call.method === "PATCH").at(-1)?.body?.status,
-  ).toBe("completed");
+  await vi.waitFor(() =>
+    expect(
+      api.calls.find(
+        (call) => call.method === "PATCH" && call.body?.status === "completed",
+      )?.body?.metadata,
+    ).toMatchObject({ mastra_native_state: "completed" }),
+  );
 });
 
 it("records and replays matching middleware and invocation memory selectors", async () => {
   const api = installTestApi();
-  const { adapter, modelCall, acquire } = fixture();
+  const { adapter, modelCall, acquire } = fixture(undefined, {
+    captureRequestContext: (context) => ({
+      [MASTRA_THREAD_ID_KEY]: context.get(MASTRA_THREAD_ID_KEY),
+      [MASTRA_RESOURCE_ID_KEY]: context.get(MASTRA_RESOURCE_ID_KEY),
+    }),
+  });
   const requestContext = new RequestContext();
   requestContext.set(MASTRA_THREAD_ID_KEY, "thread");
   requestContext.set(MASTRA_RESOURCE_ID_KEY, "resource");
@@ -220,54 +299,20 @@ it("records and replays matching middleware and invocation memory selectors", as
   await replay.consumeStream();
   expect(modelCall).toHaveBeenCalledTimes(2);
   expect(acquire).toHaveBeenCalledTimes(1);
-  expect(
-    api.calls
-      .filter((call) => call.method === "PATCH")
-      .map((call) => call.body?.status),
-  ).toEqual(["completed", "completed"]);
+  await vi.waitFor(() =>
+    expect(
+      api.calls.filter(
+        (call) => call.method === "PATCH" && call.body?.status === "completed",
+      ),
+    ).toHaveLength(2),
+  );
 });
 
 it.each([MASTRA_THREAD_ID_KEY, MASTRA_RESOURCE_ID_KEY, MASTRA_AUTH_TOKEN_KEY])(
-  "rejects late processor writes to %s",
+  "preserves native resolver mutations of %s while making recording ineligible",
   async (key) => {
-    vi.spyOn(console, "error").mockImplementation(() => {});
     const api = installTestApi();
-    const modelCall = vi.fn(async () => textStream("done"));
     const { adapter } = fixture(({ memory }) => ({
-      id: "processor-mutation",
-      name: "Processor mutation",
-      memory,
-      model: new MastraLanguageModelV2Mock({ doStream: modelCall }),
-      instructions: "Answer",
-      inputProcessors: [
-        {
-          id: "context-mutation",
-          processInput({ requestContext, messages }) {
-            if (!requestContext) throw new Error("Missing request context");
-            requestContext.setRaw(key, "FORBIDDEN");
-            return messages;
-          },
-        },
-      ],
-    }));
-    await expect(
-      adapter.stream("hello", {
-        memory: { thread: "thread", resource: "resource" },
-      }),
-    ).rejects.toThrow(/processor/i);
-    expect(modelCall).not.toHaveBeenCalled();
-    expect(JSON.stringify(api.calls)).not.toContain("FORBIDDEN");
-    expect(
-      api.calls.filter((call) => call.method === "PATCH").at(-1)?.body?.status,
-    ).toBe("failed");
-  },
-);
-
-it.each([MASTRA_THREAD_ID_KEY, MASTRA_RESOURCE_ID_KEY, MASTRA_AUTH_TOKEN_KEY])(
-  "rejects dynamic resolver mutations of %s before native execution",
-  async (key) => {
-    const api = installTestApi();
-    const { adapter, modelCall } = fixture(({ memory }) => ({
       id: "mutation",
       name: "Mutation",
       memory,
@@ -279,13 +324,18 @@ it.each([MASTRA_THREAD_ID_KEY, MASTRA_RESOURCE_ID_KEY, MASTRA_AUTH_TOKEN_KEY])(
         return "Answer";
       },
     }));
-    await expect(
-      adapter.stream("hello", {
-        memory: { thread: "thread", resource: "resource" },
-      }),
-    ).rejects.toThrow(/selector|auth/i);
-    expect(modelCall).not.toHaveBeenCalled();
-    expect(api.calls).toEqual([]);
+    const result = await adapter.stream("hello", {
+      memory: { thread: "thread", resource: "resource" },
+    });
+    await result.consumeStream();
+    expect(await result.text).toBe("done");
+    await vi.waitFor(() =>
+      expect(
+        api.calls.find(
+          (call) => call.method === "PATCH" && call.body?.status === "failed",
+        )?.body?.metadata,
+      ).toMatchObject({ mastra_replay_state: "ineligible" }),
+    );
   },
 );
 
@@ -307,25 +357,34 @@ it("never uploads provider transport credentials in session inputs", async () =>
   expect(JSON.stringify(api.calls)).not.toContain("CREDENTIAL");
 });
 
-it("rejects late auth-token additions by default-option resolvers", async () => {
+it("preserves native default-option auth tokens while marking recording ineligible", async () => {
   const api = installTestApi();
   const { adapter } = fixture(({ memory }) => ({
     id: "defaults",
     name: "Defaults",
     memory,
     instructions: "Answer",
-    model: new MastraLanguageModelV2Mock({}),
+    model: new MastraLanguageModelV2Mock({
+      doStream: async () => textStream("done"),
+    }),
     defaultOptions: ({ requestContext }) => {
       requestContext.setRaw(MASTRA_AUTH_TOKEN_KEY, "CREDENTIAL");
       return {};
     },
   }));
-  await expect(
-    adapter.stream("hello", {
-      memory: { thread: "thread", resource: "resource" },
-    }),
-  ).rejects.toThrow(/auth/i);
-  expect(api.calls).toEqual([]);
+  const result = await adapter.stream("hello", {
+    memory: { thread: "thread", resource: "resource" },
+  });
+  await result.consumeStream();
+  expect(await result.text).toBe("done");
+  await vi.waitFor(() =>
+    expect(
+      api.calls.find(
+        (call) => call.method === "PATCH" && call.body?.status === "failed",
+      )?.body?.metadata,
+    ).toMatchObject({ mastra_replay_state: "ineligible" }),
+  );
+  expect(JSON.stringify(api.calls)).not.toContain("CREDENTIAL");
 });
 
 it("marks nested abort signals as unsupported transport configuration", () => {
@@ -339,7 +398,7 @@ it("marks nested abort signals as unsupported transport configuration", () => {
       ...createMemoryReplayEnvelope(original),
       configuration,
     }),
-  ).toThrow(/transport/i);
+  ).toThrow(/transport|sensitive key/i);
 });
 
 it("rejects replay envelopes with selectors inconsistent with the snapshot", () => {
@@ -421,4 +480,56 @@ it("preserves native stream errors when cleanup and diagnostics reject", async (
   );
 });
 
-import { Agent } from "@mastra/core/agent";
+it.each([MASTRA_THREAD_ID_KEY, MASTRA_RESOURCE_ID_KEY, MASTRA_AUTH_TOKEN_KEY])(
+  "keeps two native streams usable after a processor changes implicit context %s",
+  async (key) => {
+    const api = installTestApi();
+    const modelCall = vi.fn(async () => textStream("done"));
+    const processorCall = vi.fn();
+    const { adapter } = fixture(({ memory }) => ({
+      id: "processor-mutation",
+      name: "Processor mutation",
+      memory,
+      model: new MastraLanguageModelV2Mock({ doStream: modelCall }),
+      instructions: "Answer",
+      inputProcessors: [
+        {
+          id: "context-mutation",
+          processInput({ requestContext, messages }) {
+            processorCall();
+            if (!requestContext) throw new Error("Missing request context");
+            requestContext.setRaw(key, "FORBIDDEN");
+            return messages;
+          },
+        },
+      ],
+    }));
+    for (let index = 1; index <= 2; index++) {
+      const result = await adapter.stream("hello", {
+        memory: { thread: "thread", resource: "resource" },
+      });
+      await result.consumeStream();
+      expect(await result.text).toBe("done");
+      await vi.waitFor(() =>
+        expect(
+          api.calls.filter(
+            (call) => call.method === "PATCH" && call.body?.status === "failed",
+          ),
+        ).toHaveLength(index),
+      );
+    }
+    expect(processorCall).toHaveBeenCalledTimes(2);
+    expect(modelCall).toHaveBeenCalledTimes(2);
+    expect(
+      api.calls
+        .filter(
+          (call) => call.method === "PATCH" && call.body?.status === "failed",
+        )
+        .every(
+          (call) =>
+            (call.body?.metadata as Record<string, unknown> | undefined)
+              ?.mastra_replay_state === "ineligible",
+        ),
+    ).toBe(true);
+  },
+);

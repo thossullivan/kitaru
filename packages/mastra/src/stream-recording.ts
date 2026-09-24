@@ -1,6 +1,7 @@
 import { createRequire } from "node:module";
-import type { JsonValue, KitaruClient } from "@zenml-io/kitaru";
+import type { JsonValue } from "@zenml-io/kitaru";
 import {
+  type AdapterClient,
   type AdapterRunState,
   parseModelSettings,
   type ReplayContext,
@@ -18,6 +19,7 @@ import {
   restoreConversationContext,
   unsupportedContext,
 } from "./conversation-context.js";
+import { MastraOMDivergenceError } from "./om-result-tape.js";
 import {
   assertReplayToolCoverage,
   stripLiveMemoryOptions,
@@ -39,13 +41,22 @@ type StreamAgent = {
   listConfiguredInputProcessors?: (requestContext?: unknown) => unknown;
 };
 
-export class StatefulRecordingError extends Error {}
+export class StatefulRecordingError extends Error {
+  constructor(
+    message: string,
+    readonly reasonCode = "capture_incomplete",
+  ) {
+    super(message);
+  }
+}
 
 export interface StatefulStreamRecording {
   input: JsonValue;
+  sanitizeEvidence?: <T>(value: T) => T;
   initialize(state: AdapterRunState): void;
   takeRequest(): RequestEvidence | undefined;
-  finish(): Promise<void>;
+  finish(): Promise<JsonValue>;
+  release(): Promise<void>;
 }
 
 interface StreamRecordingOptions {
@@ -54,13 +65,15 @@ interface StreamRecordingOptions {
   agent: StreamAgent;
   callerMessages: unknown;
   callerOptions: RuntimeStreamOptions;
-  client: KitaruClient;
+  client: AdapterClient;
   options: KitaruAgentOptions;
   replayInput: JsonValue;
   requestedModelId: string;
   sessionName?: string;
   startedAt: string;
   replay: ReplayContext;
+  nativeFallback?: (error: unknown) => Promise<unknown>;
+  markNativeStart?: () => void;
 }
 
 const ERROR_STEP_GRACE_MS = 250;
@@ -178,6 +191,15 @@ function getTripwireReason(value: unknown): string | undefined {
 }
 
 function getSafeStreamError(error: unknown): Error {
+  if (
+    error instanceof MastraOMDivergenceError ||
+    (error instanceof Error &&
+      (error.message.includes(
+        "Recorded Mastra observational memory diverged:",
+      ) ||
+        error.message === "KITARU_REPLAY_DIVERGED:mastra_om_call_order"))
+  )
+    return new Error("KITARU_REPLAY_DIVERGED:mastra_om_call_order");
   const name =
     error instanceof Error &&
     error.name.length <= MAX_STREAM_ERROR_NAME_LENGTH &&
@@ -202,7 +224,9 @@ class StreamLifecycle {
   #recordingError?: {
     error: unknown;
     stage: StreamRecordingErrorStage;
+    reasonCode: string;
   };
+  #nativeState: "pending" | "completed" | "failed" = "pending";
   #stepTail: Promise<void> = Promise.resolve();
 
   constructor(
@@ -213,7 +237,6 @@ class StreamLifecycle {
 
   async record(step: RecordedStep): Promise<void> {
     if (this.#recordingError !== undefined) return;
-    let writeFailure: { error: unknown } | undefined;
     const write = this.#stepTail.then(() =>
       recordStep(
         this.recorder.state,
@@ -221,22 +244,31 @@ class StreamLifecycle {
         this.options.costCalculator,
         this.options.recordingLimits,
         this.stateful?.takeRequest(),
+        this.stateful?.sanitizeEvidence,
       ),
     );
     this.#stepTail = write.catch((error: unknown) => {
-      writeFailure = { error };
-      this.requestRecordingFailure("step", error);
+      this.requestRecordingFailure("step", error, "recording_step_failed");
     });
     await this.#stepTail;
-    if (writeFailure !== undefined) {
-      await this.cleanup(writeFailure.error, "recording");
-    }
   }
 
   async complete(result: unknown): Promise<void> {
     this.cancelDeferredFailure();
     if (this.recorder.state.failure !== undefined) {
       this.requestFailure(this.recorder.state.failure);
+    }
+    if (this.stateful && !this.recorder.state.spec) {
+      // Mastra can start observational work after the actor finishes. Keep its
+      // recorder and source lease alive without delaying the native stream.
+      void this.finalize(true, result).catch((error: unknown) => {
+        this.requestRecordingFailure(
+          "complete",
+          error,
+          "recording_finalization_failed",
+        );
+      });
+      return;
     }
     await this.finalize(true, result);
   }
@@ -249,6 +281,14 @@ class StreamLifecycle {
     }
     this.requestFailure(error);
     await this.finalize(false);
+  }
+
+  markNativeCompleted(): void {
+    if (this.#nativeState === "pending") this.#nativeState = "completed";
+  }
+
+  markNativeFailed(): void {
+    this.#nativeState = "failed";
   }
 
   deferFailure(error: unknown): void {
@@ -271,9 +311,10 @@ class StreamLifecycle {
   private requestRecordingFailure(
     stage: StreamRecordingErrorStage,
     error: unknown,
+    reasonCode: string,
   ): void {
     if (this.#recordingError !== undefined) return;
-    this.#recordingError = { error, stage };
+    this.#recordingError = { error, stage, reasonCode };
     this.notify(stage, error);
   }
 
@@ -286,48 +327,108 @@ class StreamLifecycle {
 
   private async finalize(complete: boolean, result?: unknown): Promise<void> {
     this.#finalizerPromise ??= (async () => {
-      await this.#stepTail;
       try {
-        await this.stateful?.finish();
-      } catch (error) {
-        if (error instanceof StatefulRecordingError)
-          this.requestRecordingFailure("complete", error);
-        else this.requestFailure(error);
-      }
-      if (this.#recordingError !== undefined) {
-        await this.cleanup(this.#recordingError.error, "recording");
-        return;
-      }
-      if (!this.#failureRequested && complete) {
-        // The API cannot reopen a terminal session. Choose completion once all
-        // queued steps settle; later aborts cannot reverse this terminal write.
-        this.#completionStarted = true;
-        let completionFailure: { error: unknown } | undefined;
+        await this.#stepTail;
+        let finalInput: JsonValue | undefined;
         try {
-          await this.recorder.complete(result);
+          finalInput = await this.stateful?.finish();
         } catch (error) {
-          completionFailure = { error };
-          this.requestRecordingFailure("complete", error);
+          if (
+            this.recorder.state.spec &&
+            error instanceof MastraOMDivergenceError
+          )
+            this.requestFailure(getSafeStreamError(error));
+          else
+            this.requestRecordingFailure(
+              "complete",
+              error,
+              error instanceof StatefulRecordingError
+                ? error.reasonCode
+                : "recording_finalization_failed",
+            );
         }
-        if (completionFailure !== undefined) {
-          await this.cleanup(completionFailure.error, "recording");
+        if (this.#failureRequested) {
+          await this.cleanup(this.#failureReason, "run");
+          return;
         }
-      }
-      if (this.#failureRequested) {
-        await this.cleanup(this.#failureReason, "run");
+        if (this.#recordingError !== undefined) {
+          await this.cleanup(this.#recordingError.error, "recording");
+          return;
+        }
+        if (!this.#failureRequested && complete) {
+          this.#completionStarted = true;
+          try {
+            await this.recorder.complete(
+              result,
+              this.stateful && !this.recorder.state.spec
+                ? {
+                    inputs: finalInput,
+                    metadata: {
+                      mastra_replay_state: "eligible",
+                      mastra_native_state: "completed",
+                    },
+                  }
+                : undefined,
+            );
+          } catch (error) {
+            this.requestRecordingFailure(
+              "complete",
+              error,
+              "recording_completion_failed",
+            );
+            await this.cleanup(error, "recording");
+          }
+        }
+        if (this.#failureRequested)
+          await this.cleanup(this.#failureReason, "run");
+      } finally {
+        await this.stateful
+          ?.release()
+          .catch((error: unknown) => this.notify("complete", error));
       }
     })();
     await this.#finalizerPromise;
   }
 
   private cleanup(error: unknown, kind: "recording" | "run"): Promise<void> {
-    this.#cleanupPromise ??= (
-      kind === "recording"
-        ? this.recorder.failRecording(
-            new Error("Kitaru stream recording failed"),
-          )
-        : this.recorder.fail(error)
-    ).catch(() => undefined);
+    this.#cleanupPromise ??= (async () => {
+      const reasonCode = this.#recordingError?.reasonCode;
+      const safeError = getSafeStreamError(error);
+      const omDiverged =
+        safeError.message === "KITARU_REPLAY_DIVERGED:mastra_om_call_order";
+      const metadata: Record<string, JsonValue> | undefined =
+        this.stateful && !this.recorder.state.spec
+          ? {
+              mastra_replay_state: "ineligible",
+              mastra_replay_reason:
+                reasonCode ??
+                (kind === "run" ? "native_run_failed" : "recording_failed"),
+              mastra_native_state: this.#nativeState,
+            }
+          : this.stateful && this.recorder.state.spec
+            ? {
+                mastra_replay_state: omDiverged ? "diverged" : "failed",
+                mastra_replay_reason: omDiverged
+                  ? "mastra_om_call_order"
+                  : "replay_failed",
+              }
+            : undefined;
+      if (kind === "recording") {
+        await this.recorder.failRecording(
+          new Error(`KITARU_RECORDING_INCOMPLETE:${reasonCode ?? "unknown"}`),
+          metadata,
+        );
+      } else {
+        await this.recorder.fail(
+          reasonCode
+            ? new Error(
+                `${safeError.message}; KITARU_RECORDING_INCOMPLETE:${reasonCode}`,
+              )
+            : error,
+          metadata,
+        );
+      }
+    })().catch(() => undefined);
     return this.#cleanupPromise;
   }
 
@@ -351,7 +452,7 @@ class StreamLifecycle {
   }
 }
 
-export async function streamWithRecording({
+async function recordedStreamWithRecording({
   stateful,
   adapterVersion,
   agent,
@@ -364,6 +465,7 @@ export async function streamWithRecording({
   sessionName,
   startedAt,
   replay,
+  markNativeStart,
 }: StreamRecordingOptions): Promise<unknown> {
   assertStreamSupported(agent);
   const resolvedDefaults =
@@ -489,6 +591,14 @@ export async function streamWithRecording({
         effectiveInput: recordedInput,
         effectiveModelSettings: serializedSettings(effective.modelSettings),
         framework: "mastra",
+        ...(stateful && !replay.spec
+          ? {
+              metadata: {
+                mastra_replay_state: "pending",
+                mastra_native_state: "pending",
+              },
+            }
+          : {}),
         name: sessionName,
         replayId: replay.replayId,
         requestedModelId,
@@ -499,7 +609,18 @@ export async function streamWithRecording({
       try {
         await recorder.initialize();
       } catch (error) {
-        await recorder.fail(error).catch(() => undefined);
+        await recorder
+          .failRecording(
+            new Error("KITARU_RECORDING_INCOMPLETE:capture_setup_failed"),
+            stateful && !replay.spec
+              ? {
+                  mastra_replay_state: "ineligible",
+                  mastra_replay_reason: "capture_setup_failed",
+                  mastra_native_state: "pending",
+                }
+              : undefined,
+          )
+          .catch(() => undefined);
         throw error;
       }
       stateful?.initialize(recorder.state);
@@ -536,7 +657,10 @@ export async function streamWithRecording({
   let modelError: unknown;
   effective.onStepFinish = async (step) => {
     const active = await initialize();
-    if (step.finishReason === "error") active.cancelDeferredFailure();
+    if (step.finishReason === "error") {
+      active.cancelDeferredFailure();
+      active.markNativeFailed();
+    }
     const pendingModelError =
       step.finishReason === "error" ? modelError : undefined;
     const recordedStep =
@@ -569,18 +693,21 @@ export async function streamWithRecording({
     try {
       await callerFinish?.(event);
     } catch (error) {
+      active.markNativeFailed();
       await active.fail(getSafeStreamError(error));
       throw error;
     }
+    active.markNativeCompleted();
     const tripwire = getTripwireReason(event);
     if (tripwire) {
       await active.fail(new Error(tripwire));
       return;
     }
-    const summary = runResultSummary(event, {
+    const rawSummary = runResultSummary(event, {
       structuredOutputField:
         effective.structuredOutput === undefined ? undefined : "object",
     });
+    const summary = stateful?.sanitizeEvidence?.(rawSummary) ?? rawSummary;
     if (
       effective.structuredOutput !== undefined &&
       isRecord(summary) &&
@@ -601,6 +728,7 @@ export async function streamWithRecording({
     modelError ??= event.error;
     const active =
       lifecycle ?? (await initializePromise?.catch(() => undefined));
+    active?.markNativeFailed();
     active?.deferFailure(
       active.recorder.state.failure ?? getSafeStreamError(modelError),
     );
@@ -608,6 +736,7 @@ export async function streamWithRecording({
   };
   effective.onAbort = async (event) => {
     const active = await initialize();
+    active.markNativeFailed();
     await active.fail(
       active.recorder.state.failure ?? new Error("Mastra stream aborted"),
     );
@@ -631,14 +760,34 @@ export async function streamWithRecording({
     };
 
   try {
+    markNativeStart?.();
     return await agent.stream(effectiveMessages, effective);
   } catch (error) {
     const active =
       lifecycle ?? (await initializePromise?.catch(() => undefined));
+    active?.markNativeFailed();
     const replayFailure = replay.spec
       ? active?.recorder.state.failure
       : undefined;
     await active?.fail(replayFailure ?? getSafeStreamError(error));
     throw replayFailure ?? error;
+  }
+}
+
+export async function streamWithRecording(
+  options: StreamRecordingOptions,
+): Promise<unknown> {
+  let nativeStarted = false;
+  try {
+    return await recordedStreamWithRecording({
+      ...options,
+      markNativeStart: () => {
+        nativeStarted = true;
+      },
+    });
+  } catch (error) {
+    if (!nativeStarted && !options.replay.spec && options.nativeFallback)
+      return options.nativeFallback(error);
+    throw error;
   }
 }

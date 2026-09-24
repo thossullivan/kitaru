@@ -14,6 +14,7 @@
 """Shared test helpers and in-memory fakes."""
 
 import asyncio
+import base64
 import hashlib
 import os
 import sys
@@ -371,6 +372,43 @@ def imported_session(
         metadata={},
         nodes=nodes or [],
     )
+
+
+@pytest.fixture
+def complete_mastra_memory_replay_inputs() -> dict[str, Any]:
+    """Build a structurally complete v3 input for server finalization tests."""
+    media_type = "text/plain"
+    content = b"recorded file"
+    reference = hashlib.sha256(media_type.encode() + b"\0" + content).hexdigest()
+    return {
+        "mastra_memory_replay": {
+            "version": 3,
+            "complete": True,
+            "reasons": [],
+            "invocationId": "test-invocation",
+            "rawInput": "hello",
+            "initialSnapshot": {
+                "threadId": "thread-1",
+                "resourceId": "resource-1",
+                "thread": None,
+                "resource": None,
+                "messages": [],
+                "records": [],
+            },
+            "configuration": {"memoryConfig": {}},
+            "requestContext": {},
+            "files": [
+                {
+                    "url": f"kitaru-file://sha256/{reference}",
+                    "mediaType": media_type,
+                    "base64": base64.b64encode(content).decode("ascii"),
+                    "length": len(content),
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                }
+            ],
+            "omTape": [],
+        }
+    }
 
 
 @pytest.fixture(autouse=True)
@@ -3098,6 +3136,24 @@ class FakeSessionRepository:
                 "created": stored.created,
                 "updated": now,
                 "inputs": stored.inputs,
+                "outputs": session.outputs
+                if "outputs" in session.model_fields_set
+                else stored.outputs,
+            }
+        )
+        self._sessions[session.id] = updated
+        return self._copy(updated, include_payloads=False)
+
+    async def finalize_replay_inputs(self, session: Session) -> Session:
+        """Persist final replay input and status in one fake repository update."""
+        stored = self._sessions.get(session.id)
+        if stored is None:
+            raise SessionNotFound(session.id)
+        self._check_duplicate_external_id(session)
+        updated = session.model_copy(
+            update={
+                "created": stored.created,
+                "updated": _renewed_timestamp(stored.updated),
                 "outputs": session.outputs
                 if "outputs" in session.model_fields_set
                 else stored.outputs,

@@ -9,9 +9,12 @@ export {
   boundedRecorderConversion,
   boundedRecorderJson,
   boundRecordedSize,
+  MAX_MASTRA_REPLAY_ITEMS,
+  MAX_MASTRA_REPLAY_JSON_BYTES,
   MAX_RECORDED_PAYLOAD_CHARS,
   MAX_RECORDED_STRING_CHARS,
   normalizeRecordingLimits,
+  projectMastraReplayInput,
   projectRecordedInput,
   projectRecordedMetadata,
   recordedPayloadConversion,
@@ -19,6 +22,7 @@ export {
   recordedToolPayloadConversion,
   recordedToolPayloadJson,
   runResultSummary,
+  strictMastraReplayValue,
   strictRecordedJson,
 } from "./recorded-json.js";
 export type { ReplayContext } from "./replay.js";

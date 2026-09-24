@@ -13,12 +13,48 @@ export interface MastraMemorySelector {
   resourceId: string;
 }
 
-/** All writers must participate in this application's lease, including other processes. */
+export interface MastraMemoryLeaseOptions {
+  /** Bound acquisition so a live answer does not wait for a delayed reflection. */
+  waitMs?: number;
+  /** Cancel a waiting acquisition without releasing another writer's lease. */
+  signal?: AbortSignal;
+  /** An advisory notification; verifyEligibility is the authoritative check. */
+  onConflict?: () => void;
+}
+
+/** A callable release keeps existing direct lease users source compatible. */
+export interface MastraMemoryLease {
+  (): Promise<void>;
+  /** Read the shared coordination state, including conflict and lease loss. */
+  verifyEligibility(): Promise<boolean>;
+}
+
+/**
+ * Coordinate every writer of a source thread across all application processes.
+ *
+ * The implementation must atomically poison eligibility for the thread when a
+ * competing native turn proceeds without ownership or an owner loses its lease.
+ * Poison must survive process loss and prevent a later acquisition from becoming
+ * eligible until all possible stale writers have quiesced. A timeout or failed
+ * coordination call must fail closed for replay eligibility, while native Mastra
+ * storage writes still run. Keep ownership through the final eligible-session
+ * update, then release only after no delayed source write remains possible.
+ *
+ * The process-local helper below is valid only when every writer shares one
+ * instance in one process. A production multi-server application must provide
+ * its own implementation backed by shared atomic storage.
+ */
 export interface MastraExclusiveMemoryAccess {
   acquire(
     selector: MastraMemorySelector,
-    onConflict?: () => void,
-  ): Promise<() => Promise<void>>;
+    options?: MastraMemoryLeaseOptions,
+  ): Promise<MastraMemoryLease>;
+  /** Persist an unsafe-write marker before an unowned native write proceeds.
+   * An unknown selector poisons every thread until global quiescence is proven.
+   */
+  markUnsafeWrite(selector?: MastraMemorySelector): Promise<void>;
+  /** Clear a persistent loss marker only after all writers are proven stopped. */
+  resetAfterQuiescence(selector?: MastraMemorySelector): Promise<void>;
 }
 
 /**
@@ -26,19 +62,99 @@ export interface MastraExclusiveMemoryAccess {
  * and shares this instance; distributed writers require a distributed lease.
  */
 export function createProcessLocalMemoryAccess(): MastraExclusiveMemoryAccess {
-  const activeThreads = new Map<string, (() => void) | undefined>();
+  type Turn = { onConflict?: () => void; invalidated: boolean };
+  type ThreadState = {
+    turns: Set<Turn>;
+    poisoned: boolean;
+    persistentLoss: boolean;
+  };
+  const threads = new Map<string, ThreadState>();
+  let unknownWriterPoisoned = false;
   return {
-    async acquire({ threadId }, onConflict) {
-      if (activeThreads.has(threadId)) {
-        activeThreads.get(threadId)?.();
-        throw new Error("Exclusive source-thread ownership is unavailable.");
-      }
-      activeThreads.set(threadId, onConflict);
-      let released = false;
-      return async () => {
-        if (!released) activeThreads.delete(threadId);
-        released = true;
+    async acquire({ threadId }, options = {}) {
+      if (options.signal?.aborted)
+        throw new Error("Exclusive source-thread ownership was cancelled.");
+      const state = threads.get(threadId) ?? {
+        turns: new Set<Turn>(),
+        poisoned: false,
+        persistentLoss: false,
       };
+      threads.set(threadId, state);
+      if (state.turns.size > 0) {
+        state.poisoned = true;
+        for (const turn of state.turns) {
+          turn.invalidated = true;
+          turn.onConflict?.();
+        }
+      }
+      const owner = {
+        onConflict: options.onConflict,
+        invalidated:
+          state.poisoned || state.persistentLoss || unknownWriterPoisoned,
+      };
+      state.turns.add(owner);
+      let released = false;
+      const release = async () => {
+        if (!released) state.turns.delete(owner);
+        released = true;
+        if (state.turns.size === 0 && !state.persistentLoss)
+          threads.delete(threadId);
+      };
+      return Object.assign(release, {
+        async verifyEligibility() {
+          return (
+            !released &&
+            !owner.invalidated &&
+            !state.poisoned &&
+            !state.persistentLoss &&
+            !unknownWriterPoisoned
+          );
+        },
+      });
+    },
+    async markUnsafeWrite(selector) {
+      if (!selector) {
+        unknownWriterPoisoned = true;
+        for (const state of threads.values()) {
+          state.poisoned = true;
+          state.persistentLoss = true;
+          for (const turn of state.turns) {
+            turn.invalidated = true;
+            turn.onConflict?.();
+          }
+        }
+        return;
+      }
+      const { threadId } = selector;
+      const state = threads.get(threadId) ?? {
+        turns: new Set<Turn>(),
+        poisoned: false,
+        persistentLoss: false,
+      };
+      threads.set(threadId, state);
+      state.poisoned = true;
+      // The unsafe writer may outlive every current lease. Do not let the
+      // final release erase the conflict before that writer quiesces.
+      state.persistentLoss = true;
+      for (const turn of state.turns) {
+        turn.invalidated = true;
+        turn.onConflict?.();
+      }
+    },
+    async resetAfterQuiescence(selector) {
+      if (!selector) {
+        if ([...threads.values()].some((state) => state.turns.size > 0))
+          throw new Error("Source-thread writers are still active.");
+        threads.clear();
+        unknownWriterPoisoned = false;
+        return;
+      }
+      const { threadId } = selector;
+      const state = threads.get(threadId);
+      if (!state) return;
+      if (state.turns.size > 0)
+        throw new Error("Source-thread writers are still active.");
+      threads.delete(threadId);
     },
   };
 }
@@ -61,6 +177,12 @@ export interface MastraMemoryCaptureOptions extends MastraMemorySelector {
   recordMutation: (event: MastraMemoryMutation) => Promise<void>;
   getRequestId?: () => string | undefined;
   onIncomplete?: (reason: string) => void;
+  /** Replace captured file URLs in evidence without changing native writes. */
+  sanitizeEvidence?: <T>(value: T) => T;
+  leaseWaitMs?: number;
+  leaseSignal?: AbortSignal;
+  /** Bound pre-turn storage reads so capture cannot stall a native answer. */
+  captureWaitMs?: number;
 }
 
 export interface MastraMemoryCaptureBinding {
@@ -73,7 +195,27 @@ export interface MastraMemoryCaptureBinding {
   }): Promise<MastraMemorySnapshot | undefined>;
   markIncomplete(reason: string): void;
   drain(): Promise<void>;
+  /** Check shared ownership immediately before persisting eligible inputs. */
+  verifyEligibility(): Promise<void>;
   release(): Promise<void>;
+}
+
+async function boundedCoordination<T>(
+  operation: Promise<T>,
+  waitMs: number,
+  timeoutMessage = "Source-thread coordination timed out.",
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(timeoutMessage)), waitMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 // The pinned public MemoryStorage mutation inventory. Delegation binds `this` to
@@ -110,6 +252,55 @@ const MUTATIONS = new Set<keyof MemoryStorage>([
   "updateObservationalMemoryConfig",
 ]);
 
+function record(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function modelIdentity(model: unknown): string {
+  if (typeof model === "string" && model) return model;
+  if (
+    record(model) &&
+    typeof model.modelId === "string" &&
+    typeof model.provider === "string"
+  )
+    return `${model.provider}/${model.modelId}`;
+  if (record(model) && typeof model.id === "string") return model.id;
+  throw new Error("Observational-memory model has no stable identity.");
+}
+
+/** Keep provider clients out of evidence without changing native storage calls. */
+function mutationEvidenceValue(method: PropertyKey, value: unknown): unknown {
+  if (method !== "initializeObservationalMemory") return value;
+  function project(input: unknown): unknown {
+    if (!record(input) || !record(input.config)) return input;
+    const config = { ...input.config };
+    if (config.model !== undefined) config.model = modelIdentity(config.model);
+    for (const name of ["observation", "reflection"]) {
+      const phase = config[name];
+      if (!record(phase)) continue;
+      const projected = { ...phase };
+      if (projected.model !== undefined)
+        projected.model = modelIdentity(projected.model);
+      if (Array.isArray(projected.extractors))
+        projected.extractors = projected.extractors.map((extractor) => {
+          if (
+            record(extractor) &&
+            extractor.internal === true &&
+            typeof extractor.slug === "string" &&
+            ["current-task", "suggested-response", "thread-title"].includes(
+              extractor.slug,
+            )
+          )
+            return { mastraBuiltinExtractor: extractor.slug };
+          throw new Error("Unsupported observational-memory extractor.");
+        });
+      config[name] = projected;
+    }
+    return { ...input, config };
+  }
+  return Array.isArray(value) ? value.map(project) : project(value);
+}
+
 /** Capture one native invocation without changing the shared source domain or Agent. */
 export function createMemoryCaptureBinding(
   options: MastraMemoryCaptureOptions,
@@ -119,11 +310,12 @@ export function createMemoryCaptureBinding(
   let capturing = false;
   let readingSnapshot = false;
   let released = false;
-  let releaseLease: (() => Promise<void>) | undefined;
+  let lease: MastraMemoryLease | undefined;
   let mutations = Promise.resolve();
   let evidence = Promise.resolve();
   const reasons: string[] = [];
   const methods = new Map<PropertyKey, unknown>();
+  const waitMs = options.leaseWaitMs ?? 100;
 
   function markIncomplete(reason: string): void {
     if (reasons.includes(reason)) return;
@@ -150,7 +342,10 @@ export function createMemoryCaptureBinding(
         let complete = true;
         let requestId: string | undefined;
         try {
-          encodedArguments = encodeMemoryValue(args);
+          const evidence = mutationEvidenceValue(property, args);
+          encodedArguments = encodeMemoryValue(
+            options.sanitizeEvidence?.(evidence) ?? evidence,
+          );
           requestId = options.getRequestId?.();
         } catch {
           complete = false;
@@ -172,6 +367,46 @@ export function createMemoryCaptureBinding(
         const result = mutations.then(async () => {
           let output: unknown;
           try {
+            if (released || !lease) {
+              markIncomplete(
+                "Memory mutation occurred without source-thread ownership.",
+              );
+              try {
+                await boundedCoordination(
+                  options.exclusiveAccess.markUnsafeWrite(options),
+                  waitMs,
+                );
+              } catch {
+                markIncomplete("Unsafe memory write could not be fenced.");
+              }
+            } else {
+              try {
+                if (
+                  !(await boundedCoordination(
+                    lease.verifyEligibility(),
+                    waitMs,
+                  ))
+                ) {
+                  markIncomplete("Exclusive source-thread ownership was lost.");
+                  await boundedCoordination(
+                    options.exclusiveAccess.markUnsafeWrite(options),
+                    waitMs,
+                  );
+                }
+              } catch {
+                markIncomplete(
+                  "Exclusive source-thread ownership could not be verified.",
+                );
+                try {
+                  await boundedCoordination(
+                    options.exclusiveAccess.markUnsafeWrite(options),
+                    waitMs,
+                  );
+                } catch {
+                  markIncomplete("Unsafe memory write could not be fenced.");
+                }
+              }
+            }
             output = await Reflect.apply(value, target, args);
           } catch (error) {
             markIncomplete("Native memory storage mutation failed.");
@@ -182,7 +417,10 @@ export function createMemoryCaptureBinding(
           revision += 1;
           let encodedResult: JsonValue = null;
           try {
-            encodedResult = encodeMemoryValue(output);
+            const evidence = mutationEvidenceValue(property, output);
+            encodedResult = encodeMemoryValue(
+              options.sanitizeEvidence?.(evidence) ?? evidence,
+            );
           } catch {
             complete = false;
             markIncomplete(
@@ -249,6 +487,21 @@ export function createMemoryCaptureBinding(
     }
   }
 
+  async function verifyEligibility(): Promise<void> {
+    if (released || !lease) {
+      markIncomplete("Exclusive source-thread ownership is unavailable.");
+      return;
+    }
+    try {
+      if (!(await boundedCoordination(lease.verifyEligibility(), waitMs)))
+        markIncomplete("Exclusive source-thread ownership was lost.");
+    } catch {
+      markIncomplete(
+        "Exclusive source-thread ownership could not be verified.",
+      );
+    }
+  }
+
   return {
     domain,
     get revision() {
@@ -269,61 +522,112 @@ export function createMemoryCaptureBinding(
       capturing = true;
       try {
         try {
-          releaseLease = await options.exclusiveAccess.acquire(options, () =>
-            markIncomplete(
-              "Exclusive source-thread ownership was invalidated by an overlapping invocation.",
-            ),
+          const timeout = AbortSignal.timeout(waitMs);
+          const signal = options.leaseSignal
+            ? AbortSignal.any([timeout, options.leaseSignal])
+            : timeout;
+          const attempted = options.exclusiveAccess.acquire(options, {
+            waitMs,
+            signal,
+            onConflict: () =>
+              markIncomplete(
+                "Exclusive source-thread ownership was invalidated by an overlapping invocation.",
+              ),
+          });
+          let accepted = false;
+          // A backend that ignores cancellation must not retain ownership if
+          // its acquire resolves after the caller has resumed natively.
+          void attempted.then(
+            async (lateLease) => {
+              if (!accepted && signal.aborted) {
+                try {
+                  await lateLease();
+                } catch {
+                  markIncomplete("Late source-thread lease release failed.");
+                }
+              }
+            },
+            () => undefined,
           );
+          lease = await Promise.race([
+            attempted,
+            new Promise<never>((_resolve, reject) => {
+              if (signal.aborted) reject(signal.reason);
+              else
+                signal.addEventListener("abort", () => reject(signal.reason), {
+                  once: true,
+                });
+            }),
+          ]);
+          accepted = true;
+          await verifyEligibility();
+          if (reasons.length) return undefined;
         } catch {
           markIncomplete("Exclusive source-thread ownership is unavailable.");
           return undefined;
         }
-        await memory.settled();
-        await mutations;
-        readingSnapshot = true;
-        const thread = await options.domain.getThreadById({
-          threadId: options.threadId,
-        });
-        const resource = await options.domain.getResourceById({
-          resourceId: options.resourceId,
-        });
-        const { messages } = await options.domain.listMessages({
-          threadId: options.threadId,
-          perPage: false,
-        });
-        const records = await options.domain.getObservationalMemoryHistory(
-          options.threadId,
-          options.resourceId,
+        const capture = (async () => {
+          await memory.settled();
+          await mutations;
+          readingSnapshot = true;
+          try {
+            const thread = await options.domain.getThreadById({
+              threadId: options.threadId,
+            });
+            const resource = await options.domain.getResourceById({
+              resourceId: options.resourceId,
+            });
+            const { messages } = await options.domain.listMessages({
+              threadId: options.threadId,
+              perPage: false,
+            });
+            const records = await options.domain.getObservationalMemoryHistory(
+              options.threadId,
+              options.resourceId,
+            );
+            const snapshot = {
+              threadId: options.threadId,
+              resourceId: options.resourceId,
+              thread,
+              resource,
+              messages,
+              records,
+            };
+            // No storage-owned objects or Dates escape the explicit codec.
+            const copy = decodeMemoryValue(encodeMemoryValue(snapshot));
+            validateMemorySnapshot(copy);
+            return copy;
+          } finally {
+            readingSnapshot = false;
+          }
+        })();
+        const copy = await boundedCoordination(
+          capture,
+          options.captureWaitMs ?? 5_000,
+          "Initial memory capture timed out.",
         );
-        const snapshot = {
-          threadId: options.threadId,
-          resourceId: options.resourceId,
-          thread,
-          resource,
-          messages,
-          records,
-        };
-        // Copy through the explicit codec: no storage-owned objects or Dates escape.
-        const copy = decodeMemoryValue(encodeMemoryValue(snapshot));
-        validateMemorySnapshot(copy);
+        await verifyEligibility();
         return reasons.length === 0 ? copy : undefined;
-      } catch {
+      } catch (error) {
         markIncomplete(
-          "Initial memory capture failed: unsupported, altered, or Unjoined observational-memory state.",
+          error instanceof Error &&
+            error.message === "Initial memory capture timed out."
+            ? error.message
+            : "Initial memory capture failed: unsupported, altered, or Unjoined observational-memory state.",
         );
         return undefined;
       } finally {
         capturing = false;
-        readingSnapshot = false;
       }
     },
     drain,
+    verifyEligibility,
     async release() {
       if (released) return;
       await drain();
       released = true;
       try {
-        await releaseLease?.();
+        await lease?.();
       } catch {
         markIncomplete("Exclusive source-thread lease release failed.");
       }

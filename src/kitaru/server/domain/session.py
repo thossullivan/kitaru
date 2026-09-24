@@ -13,6 +13,10 @@
 #  permissions and limitations under the License.
 """Session entity, rollups, and errors."""
 
+import base64
+import binascii
+import hashlib
+import re
 import uuid
 from collections.abc import Iterable
 from datetime import datetime
@@ -201,6 +205,116 @@ class SessionNotUpdatable(ConflictError):
         super().__init__(f"Session {session_id} does not accept updates")
 
 
+class SessionReplayFinalizationInvalid(ValidationError):
+    """Raised when a Mastra replay input transition is incomplete or unauthorized."""
+
+    def __init__(self, session_id: uuid.UUID) -> None:
+        """Initialize the error.
+
+        Args:
+            session_id: Id of the session.
+        """
+        super().__init__(f"Session {session_id} has invalid Mastra replay finalization")
+
+
+class SessionReplayNotReady(ConflictError):
+    """Raised when a Mastra baseline cannot be replayed yet."""
+
+    def __init__(self, session_id: uuid.UUID, reason: str) -> None:
+        """Initialize the error.
+
+        Args:
+            session_id: Id of the baseline session.
+            reason: Stable replay eligibility reason code.
+        """
+        super().__init__(f"Session {session_id}: {reason}")
+        self.reason = reason
+
+
+def mastra_replay_uses_observational_memory(envelope: dict[str, Any]) -> bool:
+    """Return whether a recorded Mastra replay input enables observational memory."""
+    config = envelope.get("configuration")
+    memory = config.get("memoryConfig") if isinstance(config, dict) else None
+    om = memory.get("observationalMemory") if isinstance(memory, dict) else None
+    return om is True or (isinstance(om, dict) and om.get("enabled") is not False)
+
+
+def mastra_replay_v3_complete(envelope: dict[str, Any]) -> bool:
+    """Check the required shape of a finalized Mastra replay input."""
+    snapshot = envelope.get("initialSnapshot")
+    config = envelope.get("configuration")
+    files = envelope.get("files")
+    return (
+        envelope.get("version") == 3
+        and envelope.get("complete") is True
+        and envelope.get("reasons") == []
+        and isinstance(envelope.get("invocationId"), str)
+        and bool(envelope["invocationId"])
+        and "rawInput" in envelope
+        and isinstance(snapshot, dict)
+        and isinstance(snapshot.get("threadId"), str)
+        and isinstance(snapshot.get("resourceId"), str)
+        and isinstance(snapshot.get("messages"), list)
+        and isinstance(snapshot.get("records"), list)
+        and isinstance(config, dict)
+        and isinstance(config.get("memoryConfig"), dict)
+        and isinstance(envelope.get("requestContext"), dict)
+        and isinstance(files, list)
+        and _mastra_replay_files_complete(files)
+        and isinstance(envelope.get("omTape"), list)
+    )
+
+
+def _mastra_replay_files_complete(files: list[Any]) -> bool:
+    """Validate bounded file references before publishing replay eligibility."""
+    if len(files) > 64:
+        return False
+    seen: set[str] = set()
+    total_bytes = 0
+    for file in files:
+        if not isinstance(file, dict):
+            return False
+        url = file.get("url")
+        media_type = file.get("mediaType")
+        encoded = file.get("base64")
+        length = file.get("length")
+        digest = file.get("sha256")
+        if (
+            not isinstance(url, str)
+            or url in seen
+            or not isinstance(media_type, str)
+            or not media_type
+            or not isinstance(encoded, str)
+            or not isinstance(length, int)
+            or isinstance(length, bool)
+            or length < 0
+            or length > 8 * 1_048_576
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[a-f0-9]{64}", digest) is None
+        ):
+            return False
+        try:
+            content = base64.b64decode(encoded, validate=True)
+            reference = (
+                "kitaru-file://sha256/"
+                + hashlib.sha256(media_type.encode() + b"\0" + content).hexdigest()
+            )
+        except (binascii.Error, ValueError, UnicodeEncodeError):
+            return False
+        if (
+            base64.b64encode(content).decode("ascii") != encoded
+            or len(content) != length
+            or hashlib.sha256(content).hexdigest() != digest
+            or url != reference
+        ):
+            return False
+        total_bytes += length
+        if total_bytes > 16 * 1_048_576:
+            return False
+        seen.add(url)
+    return True
+
+
 class SessionRollups(FrozenModel):
     """Session rollup deltas."""
 
@@ -330,6 +444,62 @@ class Session(DomainModel):
         """
         if self.status != SessionStatus.IN_PROGRESS:
             raise SessionNotUpdatable(self.id)
+
+    def check_replay_finalization(
+        self,
+        status: SessionStatus,
+        metadata: dict[str, Any],
+        inputs: Any,
+        replacing_inputs: bool,
+    ) -> None:
+        """Require an atomic, one-time transition for final Mastra replay inputs.
+
+        Args:
+            status: Session status after the update.
+            metadata: Session metadata after the update.
+            inputs: Replacement input value, when supplied.
+            replacing_inputs: Whether the request explicitly supplied inputs.
+        """
+        is_mastra_recording = (
+            self.framework == "mastra" and self.origin == SessionOrigin.RECORDED
+        )
+        if not is_mastra_recording:
+            if replacing_inputs:
+                raise SessionReplayFinalizationInvalid(self.id)
+            return
+        prior = self.metadata.get("mastra_replay_state")
+        next_state = metadata.get("mastra_replay_state")
+        if prior != "pending":
+            if replacing_inputs:
+                raise SessionReplayFinalizationInvalid(self.id)
+            return
+        if status == SessionStatus.IN_PROGRESS:
+            if replacing_inputs or next_state != "pending":
+                raise SessionReplayFinalizationInvalid(self.id)
+            return
+        if next_state not in {"eligible", "ineligible"}:
+            raise SessionReplayFinalizationInvalid(self.id)
+        if replacing_inputs and (
+            not isinstance(inputs, dict)
+            or not isinstance(inputs.get("mastra_memory_replay"), dict)
+        ):
+            raise SessionReplayFinalizationInvalid(self.id)
+        if next_state == "eligible":
+            envelope = (
+                inputs.get("mastra_memory_replay")
+                if replacing_inputs and isinstance(inputs, dict)
+                else None
+            )
+            if (
+                status != SessionStatus.COMPLETED
+                or not isinstance(envelope, dict)
+                or not mastra_replay_v3_complete(envelope)
+            ):
+                raise SessionReplayFinalizationInvalid(self.id)
+            if mastra_replay_uses_observational_memory(envelope) and not isinstance(
+                envelope.get("omTape"), list
+            ):
+                raise SessionReplayFinalizationInvalid(self.id)
 
     def check_evaluate(self) -> None:
         """Require the session to currently accept evaluations.

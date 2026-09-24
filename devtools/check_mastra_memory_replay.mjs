@@ -23,7 +23,7 @@ const directory = process.env.CHECK_DIRECTORY;
 const replayId = process.env.KITARU_REPLAY_ID;
 const thread = "historical-thread";
 const resource = "historical-resource";
-const fileUrl = "https://files.invalid/historical.pdf";
+const fileUrl = "https://files.invalid/historical.pdf?token=historical-secret";
 const bytes = new Uint8Array(40000).fill(65);
 const report = {
   task_id: process.env.KITARU_TASK_ID,
@@ -109,7 +109,24 @@ const actor = (id) => ({
     return text("done");
   },
 });
-const models = { actor: actor("actor"), replacement: actor("replacement") };
+const observationModel = (id) => ({
+  specificationVersion: "v2",
+  supportedUrls: {},
+  provider: "fixture",
+  modelId: id,
+  doGenerate: async () => {
+    throw new Error("Unexpected OM generate call");
+  },
+  doStream: async () => {
+    throw new Error("Unexpected OM model call");
+  },
+});
+const models = {
+  actor: actor("actor"),
+  replacement: actor("replacement"),
+  observer: observationModel("observer"),
+  reflector: observationModel("reflector"),
+};
 const store = new InMemoryStore();
 const memory = new Memory({
   storage: store,
@@ -120,6 +137,11 @@ const memory = new Memory({
       enabled: true,
       scope: "thread",
       schema: z.object({ preference: z.string() }),
+    },
+    observationalMemory: {
+      scope: "thread",
+      observation: { model: "fixture/observer", messageTokens: 100000 },
+      reflection: { model: "fixture/reflector", observationTokens: 100000 },
     },
   },
 });
@@ -137,6 +159,44 @@ await memory.updateWorkingMemory({
   threadId: thread,
   resourceId: resource,
   workingMemory: JSON.stringify(currentProduction),
+});
+const nestedHotels = Array.from({ length: 1500 }, (_, hotel) => ({
+  id: hotel,
+  details: Object.fromEntries(
+    Array.from({ length: 10 }, (_, field) => [`field${field}`, field]),
+  ),
+}));
+await domain.saveMessages({
+  messages: Array.from({ length: 830 }, (_, index) => ({
+    id: `historical-${index}`,
+    role: "user",
+    content: {
+      format: 2,
+      parts: [
+        {
+          type: "text",
+          text: index === 0 ? "HISTORICAL_MESSAGE: " + "x".repeat(1_100_000) : `history ${index}`,
+        },
+      ],
+      ...(index === 0 ? { metadata: { hotels: nestedHotels } } : {}),
+    },
+    createdAt: new Date(Date.UTC(2026, 0, 1, 0, 0, index)),
+    threadId: thread,
+    resourceId: resource,
+  })),
+});
+const omRecord = await domain.initializeObservationalMemory({
+  threadId: thread,
+  resourceId: resource,
+  scope: "thread",
+  config: { fixture: true },
+});
+await domain.updateActiveObservations({
+  id: omRecord.id,
+  observations: "HISTORICAL_OBSERVATION: likes blue.",
+  tokenCount: 10,
+  lastObservedAt: new Date(Date.UTC(2026, 0, 1, 0, 0, 0)),
+  observedMessageIds: ["historical-0"],
 });
 const sourceDomain = new Proxy(domain, {
   get(target, key) {
@@ -171,7 +231,11 @@ const agent = createMemoryReplayAgent(
         id: "historical-file",
         async processInput({ messages }) {
           report.processor_calls++;
-          const file = await resolveFile(fileUrl);
+          const filePart = messages
+            .flatMap((message) => message.content.parts)
+            .find((part) => part.type === "file");
+          assert(filePart, "Expected a file in native processor input");
+          const file = await resolveFile(String(filePart.data));
           assert.deepEqual(file.bytes, bytes);
           return messages.map((message) => ({
             ...message,

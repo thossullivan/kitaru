@@ -15,12 +15,23 @@ it("hashes skills by content and refuses changed content or symlinks", async () 
     );
     const baseline = await loadSkillsWorkspace(root);
     expect(baseline.manifest.files[0]?.path).toBe("triage/SKILL.md");
+    expect(baseline.manifest.directories).toEqual([".", "triage"]);
     expect(await baseline.workspace.skills?.list()).toEqual(
       expect.arrayContaining([expect.objectContaining({ name: "triage" })]),
     );
     expect(
       (await loadSkillsWorkspace(root, baseline.manifest)).manifest,
     ).toEqual(baseline.manifest);
+    await mkdir(join(root, "extra"));
+    await expect(loadSkillsWorkspace(root, baseline.manifest)).rejects.toThrow(
+      /changed/,
+    );
+    await rm(join(root, "extra"), { recursive: true });
+    await writeFile(join(root, "triage", "new.md"), "new instructions");
+    await expect(loadSkillsWorkspace(root, baseline.manifest)).rejects.toThrow(
+      /changed/,
+    );
+    await rm(join(root, "triage", "new.md"));
     await writeFile(path, "changed");
     expect(
       JSON.stringify(await baseline.workspace.skills?.get("triage")),

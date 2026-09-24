@@ -99,7 +99,11 @@ from kitaru.client.config import get_config_path
 from kitaru.client.control_plane import ControlPlaneLoginError
 from kitaru.client.credential_store import CredentialStore
 from kitaru.client.device_grant import DeviceLoginError
-from kitaru.client.exceptions import APIError, InvalidServerResponseError
+from kitaru.client.exceptions import (
+    APIError,
+    InvalidServerResponseError,
+    parse_mastra_replay_reason,
+)
 
 F = TypeVar("F", bound=Callable[..., Any])
 _MACHINE_TRUE = {"1", "true", "yes", "on"}
@@ -5282,6 +5286,9 @@ def _convert_error(
         if exception.status_code == 404:
             return CLIError("not_found", detail, details=details)
         if exception.status_code == 409:
+            reason = parse_mastra_replay_reason(detail)
+            if reason is not None:
+                details["reason"] = reason
             return CLIError("conflict", detail, details=details)
         if exception.status_code in {400, 413, 422}:
             return CLIError("invalid_arguments", detail, details=details)

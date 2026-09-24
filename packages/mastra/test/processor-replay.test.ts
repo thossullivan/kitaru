@@ -34,6 +34,7 @@ afterEach(() => {
 });
 
 it("runs the native file processor with historical bytes, skills and complete large request evidence", async () => {
+  const signedFileUrl = `${FILE_URL}?token=HISTORICAL_SECRET`;
   const directory = await mkdtemp(join(tmpdir(), "kitaru-stateful-files-"));
   await mkdir(join(directory, "triage"));
   await writeFile(
@@ -91,7 +92,11 @@ it("runs the native file processor with historical bytes, skills and complete la
           id: "file-content",
           async processInput({ messages }) {
             processFile();
-            const content = await resolveFile(FILE_URL);
+            const part = messages
+              .flatMap((message) => message.content.parts)
+              .find((item) => item.type === "file");
+            if (part?.type !== "file") throw new Error("Missing file");
+            const content = await resolveFile(String(part.data));
             return messages.map((message) => ({
               ...message,
               content: {
@@ -126,7 +131,7 @@ it("runs the native file processor with historical bytes, skills and complete la
           : id.includes("reflector")
             ? runtime.reflector.model
             : model,
-      files: [FILE_URL],
+      files: [signedFileUrl],
       resolveFile: fetchFile,
       skillsDirectory: directory,
     },
@@ -140,7 +145,7 @@ it("runs the native file processor with historical bytes, skills and complete la
             { type: "text", text: "Please read" },
             {
               type: "file",
-              data: new URL(FILE_URL),
+              data: new URL(signedFileUrl),
               mimeType: "application/pdf",
             },
           ],
@@ -152,8 +157,21 @@ it("runs the native file processor with historical bytes, skills and complete la
       },
     );
     await baseline.consumeStream();
+    await vi.waitFor(() =>
+      expect(
+        api.calls.some(
+          (call) =>
+            call.method === "PATCH" &&
+            (call.body?.metadata as Record<string, unknown> | undefined)
+              ?.mastra_replay_state === "eligible",
+        ),
+      ).toBe(true),
+    );
     const input = api.calls.find(
-      (call) => call.path === "/api/v1/sessions" && call.method === "POST",
+      (call) =>
+        call.method === "PATCH" &&
+        (call.body?.metadata as Record<string, unknown> | undefined)
+          ?.mastra_replay_state === "eligible",
     )?.body?.inputs;
     expect(
       (input as Record<string, { complete: boolean }>)[MEMORY_REPLAY_KEY]
@@ -187,9 +205,171 @@ it("runs the native file processor with historical bytes, skills and complete la
       ),
     ).toBe(true);
     expect(JSON.stringify(modelNodes[1]?.inputs).length).toBeGreaterThan(40000);
+    expect(JSON.stringify(api.calls)).not.toContain("HISTORICAL_SECRET");
   } finally {
     await runtime.store.close();
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+it("keeps signed URLs native while every recorded node and output uses file references", async () => {
+  const signed = "https://files.invalid/report.pdf?token=NATIVE_SECRET";
+  const runtime = createMemoryRuntime({ messageTokens: 100000 });
+  await seedMemory(runtime);
+  const api = installTestApi();
+  const toolInput = vi.fn();
+  const reported = vi.fn();
+  const modelRequests: unknown[] = [];
+  let calls = 0;
+  const model = new MastraLanguageModelV2Mock({
+    modelId: "actor",
+    provider: "fixture",
+    doStream: async (args) => {
+      modelRequests.push(args);
+      return ++calls === 1
+        ? streamParts(
+            [
+              {
+                type: "tool-call",
+                toolCallId: "signed-file",
+                toolName: "readFile",
+                input: JSON.stringify({ url: signed }),
+              },
+            ],
+            "tool-calls",
+          )
+        : textStream(`Opened ${signed}`);
+    },
+  });
+  const adapter = createMemoryReplayAgent(
+    ({ memory }) => ({
+      id: "signed-evidence",
+      name: "Signed evidence",
+      instructions: "Read the URL",
+      memory,
+      model,
+      defaultOptions: { maxSteps: 3 },
+      tools: {
+        readFile: createTool({
+          id: "readFile",
+          description: "Read a file",
+          inputSchema: z.object({ url: z.string() }),
+          execute: async ({ url }) => {
+            toolInput(url);
+            return { opened: url };
+          },
+        }),
+      },
+    }),
+    {
+      agentId: AGENT_ID,
+      apiUrl: "https://kitaru.invalid",
+      requestedModelId: "fixture/actor",
+      onRecordingError: reported,
+      sourceMemory: () => ({
+        settled: () => runtime.memory.settled(),
+        domain: runtime.domain,
+        configuration: runtime.memory.getMergedThreadConfig(),
+        exclusiveAccess: createProcessLocalMemoryAccess(),
+      }),
+      resolveModel: () => model,
+      files: [signed],
+      resolveFile: async () => ({
+        bytes: new Uint8Array([1, 2, 3]),
+        mediaType: "application/pdf",
+      }),
+    },
+  );
+  try {
+    const output = await adapter.stream(`Please open ${signed}`, {
+      memory: { thread: THREAD, resource: RESOURCE },
+    });
+    await output.consumeStream();
+    expect(await output.text).toContain(signed);
+    expect(JSON.stringify(modelRequests)).toContain("NATIVE_SECRET");
+    expect(toolInput).toHaveBeenCalledWith(signed);
+    await vi.waitFor(() =>
+      expect(
+        api.calls.some(
+          (call) =>
+            call.method === "PATCH" &&
+            (call.body?.metadata as Record<string, unknown> | undefined)
+              ?.mastra_replay_state === "eligible",
+        ),
+      ).toBe(true),
+    );
+    expect(reported).not.toHaveBeenCalled();
+    expect(JSON.stringify(api.calls)).not.toContain("NATIVE_SECRET");
+    const tool = api
+      .nodeBatches()
+      .flat()
+      .find((node) => node.node_type === "tool_call");
+    expect(JSON.stringify(tool?.inputs)).toContain("kitaru-file://sha256/");
+    expect(JSON.stringify(tool?.outputs)).toContain("kitaru-file://sha256/");
+    const completion = api.calls.find(
+      (call) =>
+        call.method === "PATCH" &&
+        (call.body?.metadata as Record<string, unknown> | undefined)
+          ?.mastra_replay_state === "eligible",
+    );
+    expect(JSON.stringify(completion?.body?.outputs)).toContain(
+      "kitaru-file://sha256/",
+    );
+  } finally {
+    await runtime.store.close();
+  }
+});
+
+it("marks a recording ineligible when model output contains an uncaptured signed URL", async () => {
+  const runtime = createMemoryRuntime({ messageTokens: 100000 });
+  await seedMemory(runtime);
+  const api = installTestApi();
+  const model = new MastraLanguageModelV2Mock({
+    modelId: "actor",
+    provider: "fixture",
+    doStream: async () =>
+      textStream("https://unknown.invalid/a?token=UNDECLARED_SECRET"),
+  });
+  const adapter = createMemoryReplayAgent(
+    ({ memory }) => ({
+      id: "unknown-signed-evidence",
+      name: "Unknown signed evidence",
+      instructions: "Answer",
+      model,
+      memory,
+    }),
+    {
+      agentId: AGENT_ID,
+      apiUrl: "https://kitaru.invalid",
+      requestedModelId: "fixture/actor",
+      sourceMemory: () => ({
+        settled: () => runtime.memory.settled(),
+        domain: runtime.domain,
+        configuration: runtime.memory.getMergedThreadConfig(),
+        exclusiveAccess: createProcessLocalMemoryAccess(),
+      }),
+      resolveModel: () => model,
+    },
+  );
+  try {
+    const output = await adapter.stream("Hello", {
+      memory: { thread: THREAD, resource: RESOURCE },
+    });
+    await output.consumeStream();
+    expect(await output.text).toContain("UNDECLARED_SECRET");
+    await vi.waitFor(() =>
+      expect(
+        api.calls.some(
+          (call) =>
+            call.method === "PATCH" &&
+            (call.body?.metadata as Record<string, unknown> | undefined)
+              ?.mastra_replay_state === "ineligible",
+        ),
+      ).toBe(true),
+    );
+    expect(JSON.stringify(api.calls)).not.toContain("UNDECLARED_SECRET");
+  } finally {
+    await runtime.store.close();
   }
 });
 

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { expect, it } from "vitest";
 import {
   createContextInput,
@@ -8,14 +9,16 @@ import {
   decodeMemoryReplayEnvelope,
   decodeMemoryValue,
   encodeMemoryValue,
+  finalizeMemoryReplayEnvelope,
 } from "../src/memory-snapshot.js";
 import {
   createMemoryRuntime,
   FILE_BYTES,
-  FILE_URL,
   seedMemory,
   snapshotMemory,
 } from "./helpers/memory-agent.js";
+
+const FILE_REF = `kitaru-file://sha256/${createHash("sha256").update("application/pdf\0").update(FILE_BYTES).digest("hex")}`;
 
 function required<T>(value: T | undefined | null): T {
   if (value === undefined || value === null)
@@ -29,7 +32,7 @@ async function fixture() {
   return {
     invocationId: "invocation-1",
     rawInput: [
-      { role: "user", content: [{ type: "file", data: new URL(FILE_URL) }] },
+      { role: "user", content: [{ type: "file", data: new URL(FILE_REF) }] },
     ],
     initialSnapshot: {
       ...(await snapshotMemory(runtime, true)),
@@ -46,7 +49,8 @@ async function fixture() {
       },
     },
     requestContext: { locale: "en" },
-    files: [{ url: FILE_URL, mediaType: "application/pdf", bytes: FILE_BYTES }],
+    files: [{ url: FILE_REF, mediaType: "application/pdf", bytes: FILE_BYTES }],
+    omTape: [],
   };
 }
 
@@ -72,7 +76,7 @@ it.each(["version", "hash", "missing", "inflight"])(
   "rejects invalid replay prerequisites: %s",
   async (kind) => {
     const envelope = createMemoryReplayEnvelope(await fixture());
-    if (kind === "version") envelope.version = 3 as 2;
+    if (kind === "version") envelope.version = 4 as 3;
     if (kind === "hash") required(envelope.files[0]).sha256 = "0".repeat(64);
     if (kind === "missing") envelope.initialSnapshot = {};
     if (kind === "inflight") {
@@ -89,9 +93,9 @@ it.each(["version", "hash", "missing", "inflight"])(
 it.each([
   { apiKey: "private-value" },
   { callback: () => "live" },
-  { value: "a".repeat(1_048_576) },
+  { value: "a".repeat(16_777_216) },
   { value: new Map([["key", "value"]]) },
-  { value: Array.from({ length: 10_001 }, () => 1) },
+  { value: Array.from({ length: 200_001 }, () => 1) },
 ])(
   "marks altered or oversized state incomplete without exposing credentials",
   async (configuration) => {
@@ -165,21 +169,114 @@ it("round-trips an empty initial conversation", async () => {
 
 it("counts aggregate envelope items, depth, and binary expansion against the shared budget", async () => {
   const input = await fixture();
-  expect(
-    createMemoryReplayEnvelope({
-      ...input,
-      configuration: { values: Array.from({ length: 6000 }, () => 1) },
-      requestContext: { values: Array.from({ length: 6000 }, () => 1) },
-    }).complete,
-  ).toBe(false);
+  const tooMany = createMemoryReplayEnvelope({
+    ...input,
+    configuration: { values: Array.from({ length: 110_000 }, () => 1) },
+    requestContext: { values: Array.from({ length: 110_000 }, () => 1) },
+  });
+  expect(tooMany.complete).toBe(false);
+  expect(tooMany.reasons[0]).toMatch(/maximum item count 200000/);
   const deep = Array.from({ length: 65 }).reduce<unknown>(
     (value) => ({ value }),
     null,
   );
   expect(() => encodeMemoryValue(deep)).toThrow(/depth/);
   const withFile = await fixture();
-  required(withFile.files[0]).bytes = new Uint8Array(800_000);
+  required(withFile.files[0]).bytes = new Uint8Array(13_000_000);
   expect(createMemoryReplayEnvelope(withFile).complete).toBe(false);
+});
+
+it.each([50, 830])(
+  "round-trips %i-message history with 15k nested fields and a file",
+  async (count) => {
+    const input = await fixture();
+    const original = required(input.initialSnapshot.messages[0]);
+    input.initialSnapshot.messages = Array.from(
+      { length: count },
+      (_, index) => ({
+        ...original,
+        id: `message-${index}`,
+        content: {
+          ...original.content,
+          parts: [
+            {
+              type: "text",
+              text: index === 0 ? "x".repeat(1_100_000) : `message ${index}`,
+            },
+          ],
+          metadata:
+            index === 0
+              ? {
+                  hotels: Array.from({ length: 1_500 }, (_, hotel) => ({
+                    id: hotel,
+                    details: Object.fromEntries(
+                      Array.from({ length: 10 }, (_, field) => [
+                        `field${field}`,
+                        field,
+                      ]),
+                    ),
+                  })),
+                }
+              : undefined,
+        },
+      }),
+    );
+    const envelope = createMemoryReplayEnvelope(input);
+    expect(envelope.complete).toBe(true);
+    expect(JSON.stringify(envelope).length).toBeGreaterThan(1_048_576);
+    expect(
+      decodeMemoryReplayEnvelope(JSON.parse(JSON.stringify(envelope))),
+    ).toEqual(input);
+  },
+);
+
+it("finalizes a separate version-3 envelope with an ordered OM tape", async () => {
+  const provisional = createMemoryReplayEnvelope(await fixture());
+  const final = finalizeMemoryReplayEnvelope(provisional, [
+    { phase: "observation", ordinal: 0, output: "remember" },
+  ]);
+  expect(final).not.toBe(provisional);
+  expect(provisional.omTape).toEqual([]);
+  expect(decodeMemoryReplayEnvelope(final).omTape).toEqual([
+    { phase: "observation", ordinal: 0, output: "remember" },
+  ]);
+  expect(() =>
+    finalizeMemoryReplayEnvelope(provisional, [{ token: "secret" }]),
+  ).toThrow();
+});
+
+it("normalizes implicit thread OM and rejects old OM envelopes without a tape", async () => {
+  const input = await fixture();
+  delete (input.configuration.memory.observationalMemory as { scope?: string })
+    .scope;
+  const current = createMemoryReplayEnvelope(input);
+  expect(current.complete).toBe(true);
+  expect(
+    decodeMemoryReplayEnvelope(current).configuration.memory,
+  ).toMatchObject({
+    observationalMemory: { scope: "thread" },
+  });
+  const old = { ...current, version: 2 };
+  delete (old as { omTape?: unknown }).omTape;
+  expect(() => decodeMemoryReplayEnvelope(old)).toThrow(
+    /mastra_om_tape_missing/,
+  );
+  const splitConfig = {
+    ...old,
+    configuration: encodeMemoryValue({
+      memoryConfig: {},
+      memory: { observationalMemory: { scope: "thread" } },
+    }),
+  };
+  expect(() => decodeMemoryReplayEnvelope(splitConfig)).toThrow(
+    /mastra_om_tape_missing/,
+  );
+  const workingOnly = await fixture();
+  delete (workingOnly.configuration.memory as { observationalMemory?: unknown })
+    .observationalMemory;
+  const oldWorking = { ...createMemoryReplayEnvelope(workingOnly), version: 2 };
+  delete (oldWorking as { omTape?: unknown }).omTape;
+  expect(decodeMemoryReplayEnvelope(oldWorking).omTape).toBeUndefined();
 });
 
 it.each(["resourceScope", "semanticRecall", "buffer", "ids", "date", "url"])(

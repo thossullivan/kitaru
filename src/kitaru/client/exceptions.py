@@ -13,6 +13,8 @@
 #  permissions and limitations under the License.
 """Typed client exceptions."""
 
+import re
+
 import httpx
 
 from kitaru.api_models.v1.agent import AgentResponse
@@ -64,6 +66,17 @@ class APIError(KitaruClientError):
         super().__init__(f"{status_code}: {detail}")
         self.status_code = status_code
         self.detail = detail
+
+
+_MASTRA_REPLAY_REASON = re.compile(
+    r"Session [0-9a-f-]{36}: (mastra_replay_[a-z][a-z0-9_]{0,63})"
+)
+
+
+def parse_mastra_replay_reason(detail: str) -> str | None:
+    """Extract a safe replay refusal code from a session conflict detail."""
+    match = _MASTRA_REPLAY_REASON.fullmatch(detail)
+    return match.group(1) if match is not None else None
 
 
 class AuthenticationError(APIError):
