@@ -27,42 +27,68 @@ function isExists(error: unknown): boolean {
   );
 }
 
-/** Test-only shared lease: atomic directory creation and persistent poison. */
+/** Test-only shared lease: atomic thread/resource coordination and poison. */
 export function createFileMemoryAccess(
   root: string,
 ): MastraExclusiveMemoryAccess & {
   simulateLeaseLoss(selector: MastraMemorySelector): Promise<void>;
 } {
-  function directory(selector: MastraMemorySelector): string {
+  function directory(kind: "thread" | "resource", id: string): string {
     return join(
       root,
-      createHash("sha256").update(selector.threadId).digest("hex"),
+      `${kind}-${createHash("sha256").update(id).digest("hex")}`,
     );
   }
   const globalPoison = join(root, "unknown-writer-poison");
 
-  async function withMutex<T>(
-    selector: MastraMemorySelector,
-    run: (dir: string) => Promise<T>,
+  async function withMutexes<T>(
+    mutexes: string[],
+    run: () => Promise<T>,
   ): Promise<T> {
-    const dir = directory(selector);
-    await mkdir(dir, { recursive: true });
-    const mutex = join(dir, "mutex");
+    const held: string[] = [];
     const deadline = Date.now() + 1000;
-    while (true) {
-      try {
-        await mkdir(mutex);
-        break;
-      } catch (error) {
-        if (!isExists(error) || Date.now() >= deadline) throw error;
-        await pause(2);
-      }
-    }
     try {
-      return await run(dir);
+      for (const mutex of mutexes) {
+        while (true) {
+          try {
+            await mkdir(mutex);
+            held.push(mutex);
+            break;
+          } catch (error) {
+            if (!isExists(error) || Date.now() >= deadline) throw error;
+            await pause(2);
+          }
+        }
+      }
+      return await run();
     } finally {
-      await rm(mutex, { recursive: true, force: true });
+      for (const mutex of held.reverse())
+        await rm(mutex, { recursive: true, force: true });
     }
+  }
+
+  async function withGlobalMutex<T>(run: () => Promise<T>): Promise<T> {
+    await mkdir(root, { recursive: true });
+    return withMutexes([join(root, "coordination-mutex")], run);
+  }
+
+  async function withScopes<T>(
+    selector: MastraMemorySelector,
+    run: (dirs: string[]) => Promise<T>,
+  ): Promise<T> {
+    return withGlobalMutex(async () => {
+      const dirs = [
+        directory("thread", selector.threadId),
+        directory("resource", selector.resourceId),
+      ].sort();
+      for (const dir of dirs) await mkdir(dir, { recursive: true });
+      // All processes acquire both scope locks in the same order. The global
+      // mutex also makes unknown-selector poison and reset atomic with them.
+      return withMutexes(
+        dirs.map((dir) => join(dir, "mutex")),
+        () => run(dirs),
+      );
+    });
   }
 
   async function exists(path: string): Promise<boolean> {
@@ -105,34 +131,38 @@ export function createFileMemoryAccess(
     let released = false;
     const release = async () => {
       if (released) return;
-      await withMutex(selector, async (dir) => {
-        if (owns) {
-          const current = await readFile(join(dir, "owner"), "utf8").catch(
-            () => undefined,
-          );
-          if (current === token) await rm(join(dir, "owner"), { force: true });
-        } else {
-          await rm(join(dir, `turn-${token}`), { force: true });
+      await withScopes(selector, async (dirs) => {
+        for (const dir of dirs) {
+          if (owns) {
+            const current = await readFile(join(dir, "owner"), "utf8").catch(
+              () => undefined,
+            );
+            if (current === token)
+              await rm(join(dir, "owner"), { force: true });
+          } else {
+            await rm(join(dir, `turn-${token}`), { force: true });
+          }
+          if (
+            !(await exists(join(dir, "owner"))) &&
+            (await activeTurns(dir)).length === 0 &&
+            !(await exists(join(dir, "persistent-loss")))
+          )
+            await rm(join(dir, "poison"), { force: true });
         }
-        if (
-          !(await exists(join(dir, "owner"))) &&
-          (await activeTurns(dir)).length === 0 &&
-          !(await exists(join(dir, "persistent-loss")))
-        )
-          await rm(join(dir, "poison"), { force: true });
       });
       released = true;
     };
     return Object.assign(release, {
       async verifyEligibility() {
         if (released || !owns) return false;
-        return withMutex(selector, async (dir) => {
-          if (
-            (await exists(globalPoison)) ||
-            (await exists(join(dir, "poison")))
-          )
-            return false;
-          return (await readFile(join(dir, "owner"), "utf8")) === token;
+        return withScopes(selector, async (dirs) => {
+          if (await exists(globalPoison)) return false;
+          for (const dir of dirs) {
+            if (await exists(join(dir, "poison"))) return false;
+            if ((await readFile(join(dir, "owner"), "utf8")) !== token)
+              return false;
+          }
+          return true;
         });
       },
     });
@@ -146,24 +176,35 @@ export function createFileMemoryAccess(
       while (true) {
         if (options.signal?.aborted)
           throw new Error("Source-thread lease wait cancelled.");
-        const status = await withMutex(selector, async (dir) => {
+        const status = await withScopes(selector, async (dirs) => {
           if (
             (await exists(globalPoison)) ||
-            (await exists(join(dir, "poison")))
+            (
+              await Promise.all(dirs.map((dir) => exists(join(dir, "poison"))))
+            ).some(Boolean)
           ) {
-            await writeFile(join(dir, `turn-${token}`), "");
+            for (const dir of dirs)
+              await writeFile(join(dir, `turn-${token}`), "");
             return "denied";
           }
-          if (await exists(join(dir, "owner"))) return "busy";
-          await writeFile(join(dir, "owner"), token, { flag: "wx" });
+          if (
+            (
+              await Promise.all(dirs.map((dir) => exists(join(dir, "owner"))))
+            ).some(Boolean)
+          )
+            return "busy";
+          for (const dir of dirs)
+            await writeFile(join(dir, "owner"), token, { flag: "wx" });
           return "owned";
         });
         if (status === "owned") return makeLease(selector, token, true);
         if (status === "denied") return makeLease(selector, token, false);
         if (Date.now() >= deadline) {
-          await withMutex(selector, async (dir) => {
-            await poison(dir, false);
-            await writeFile(join(dir, `turn-${token}`), "");
+          await withScopes(selector, async (dirs) => {
+            for (const dir of dirs) {
+              await poison(dir, false);
+              await writeFile(join(dir, `turn-${token}`), "");
+            }
           });
           return makeLease(selector, token, false);
         }
@@ -172,41 +213,50 @@ export function createFileMemoryAccess(
     },
     async markUnsafeWrite(selector) {
       if (!selector) {
-        await writeFile(globalPoison, "unsafe write");
+        await withGlobalMutex(() => writeFile(globalPoison, "unsafe write"));
         return;
       }
-      await withMutex(selector, async (dir) => {
-        await poison(dir, true);
+      await withScopes(selector, async (dirs) => {
+        for (const dir of dirs) await poison(dir, true);
       });
     },
     async resetAfterQuiescence(selector) {
       if (!selector) {
-        for (const name of await readdir(root)) {
-          if (name === "unknown-writer-poison") continue;
-          const dir = join(root, name);
+        await withGlobalMutex(async () => {
+          for (const name of await readdir(root)) {
+            if (!name.startsWith("thread-") && !name.startsWith("resource-"))
+              continue;
+            const dir = join(root, name);
+            if (
+              (await exists(join(dir, "owner"))) ||
+              (await activeTurns(dir)).length > 0
+            )
+              throw new Error("Source-thread writers are still active.");
+          }
+          await rm(globalPoison, { force: true });
+        });
+        return;
+      }
+      await withScopes(selector, async (dirs) => {
+        for (const dir of dirs) {
           if (
             (await exists(join(dir, "owner"))) ||
             (await activeTurns(dir)).length > 0
           )
             throw new Error("Source-thread writers are still active.");
         }
-        await rm(globalPoison, { force: true });
-        return;
-      }
-      await withMutex(selector, async (dir) => {
-        if (
-          (await exists(join(dir, "owner"))) ||
-          (await activeTurns(dir)).length > 0
-        )
-          throw new Error("Source-thread writers are still active.");
-        await rm(join(dir, "persistent-loss"), { force: true });
-        await rm(join(dir, "poison"), { force: true });
+        for (const dir of dirs) {
+          await rm(join(dir, "persistent-loss"), { force: true });
+          await rm(join(dir, "poison"), { force: true });
+        }
       });
     },
     async simulateLeaseLoss(selector) {
-      await withMutex(selector, async (dir) => {
-        await poison(dir, true);
-        await rm(join(dir, "owner"), { force: true });
+      await withScopes(selector, async (dirs) => {
+        for (const dir of dirs) {
+          await poison(dir, true);
+          await rm(join(dir, "owner"), { force: true });
+        }
       });
     },
   };

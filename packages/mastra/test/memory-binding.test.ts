@@ -73,6 +73,65 @@ it("rejects shared-thread overlap while allowing independent source threads", as
   await two.binding.release();
 });
 
+it("invalidates recordings on different threads sharing a resource", async () => {
+  const access = createProcessLocalMemoryAccess();
+  const first = await access.acquire({
+    threadId: "first-thread",
+    resourceId: "shared-resource",
+  });
+  expect(await first.verifyEligibility()).toBe(true);
+  const second = await access.acquire({
+    threadId: "second-thread",
+    resourceId: "shared-resource",
+  });
+  expect(await first.verifyEligibility()).toBe(false);
+  expect(await second.verifyEligibility()).toBe(false);
+  const independent = await access.acquire({
+    threadId: "third-thread",
+    resourceId: "other-resource",
+  });
+  expect(await independent.verifyEligibility()).toBe(true);
+  await first();
+  await second();
+  await independent();
+  const recovered = await access.acquire({
+    threadId: "third-thread",
+    resourceId: "shared-resource",
+  });
+  expect(await recovered.verifyEligibility()).toBe(true);
+  await recovered();
+});
+
+it("keeps a shared resource unsafe after an unowned native write", async () => {
+  const access = createProcessLocalMemoryAccess();
+  const first = await access.acquire({
+    threadId: "first-thread",
+    resourceId: "shared-resource",
+  });
+  await access.markUnsafeWrite({
+    threadId: "second-thread",
+    resourceId: "shared-resource",
+  });
+  expect(await first.verifyEligibility()).toBe(false);
+  await first();
+  const later = await access.acquire({
+    threadId: "third-thread",
+    resourceId: "shared-resource",
+  });
+  expect(await later.verifyEligibility()).toBe(false);
+  await later();
+  await access.resetAfterQuiescence({
+    threadId: "second-thread",
+    resourceId: "shared-resource",
+  });
+  const recovered = await access.acquire({
+    threadId: "third-thread",
+    resourceId: "shared-resource",
+  });
+  expect(await recovered.verifyEligibility()).toBe(true);
+  await recovered();
+});
+
 it("shows why separate process-local helpers cannot qualify for multi-server replay", async () => {
   const first = createProcessLocalMemoryAccess();
   const second = createProcessLocalMemoryAccess();

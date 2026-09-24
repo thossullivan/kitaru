@@ -30,10 +30,10 @@ export interface MastraMemoryLease {
 }
 
 /**
- * Coordinate every writer of a source thread across all application processes.
+ * Coordinate every writer of a source thread or resource across all processes.
  *
- * The implementation must atomically poison eligibility for the thread when a
- * competing native turn proceeds without ownership or an owner loses its lease.
+ * The implementation must atomically poison eligibility for both selectors when
+ * a competing native turn proceeds without ownership or an owner loses its lease.
  * Poison must survive process loss and prevent a later acquisition from becoming
  * eligible until all possible stale writers have quiesced. A timeout or failed
  * coordination call must fail closed for replay eligibility, while native Mastra
@@ -63,50 +63,75 @@ export interface MastraExclusiveMemoryAccess {
  */
 export function createProcessLocalMemoryAccess(): MastraExclusiveMemoryAccess {
   type Turn = { onConflict?: () => void; invalidated: boolean };
-  type ThreadState = {
+  type ScopeState = {
     turns: Set<Turn>;
     poisoned: boolean;
     persistentLoss: boolean;
   };
-  const threads = new Map<string, ThreadState>();
+  const scopes = new Map<string, ScopeState>();
   let unknownWriterPoisoned = false;
-  return {
-    async acquire({ threadId }, options = {}) {
-      if (options.signal?.aborted)
-        throw new Error("Exclusive source-thread ownership was cancelled.");
-      const state = threads.get(threadId) ?? {
+
+  function keys({ threadId, resourceId }: MastraMemorySelector): string[] {
+    return [`thread:${threadId}`, `resource:${resourceId}`];
+  }
+
+  function getState(key: string): ScopeState {
+    let state = scopes.get(key);
+    if (!state) {
+      state = {
         turns: new Set<Turn>(),
         poisoned: false,
         persistentLoss: false,
       };
-      threads.set(threadId, state);
-      if (state.turns.size > 0) {
-        state.poisoned = true;
-        for (const turn of state.turns) {
-          turn.invalidated = true;
-          turn.onConflict?.();
-        }
-      }
+      scopes.set(key, state);
+    }
+    return state;
+  }
+
+  function poison(states: readonly ScopeState[], persistent: boolean): void {
+    const affected = new Set<Turn>();
+    for (const state of states) {
+      state.poisoned = true;
+      if (persistent) state.persistentLoss = true;
+      for (const turn of state.turns) affected.add(turn);
+    }
+    for (const turn of affected) {
+      turn.invalidated = true;
+      turn.onConflict?.();
+    }
+  }
+
+  return {
+    async acquire(selector, options = {}) {
+      if (options.signal?.aborted)
+        throw new Error("Exclusive source-thread ownership was cancelled.");
+      const scopeKeys = keys(selector);
+      const states = scopeKeys.map(getState);
+      const occupied = states.filter((state) => state.turns.size > 0);
+      if (occupied.length > 0) poison(occupied, false);
       const owner = {
         onConflict: options.onConflict,
         invalidated:
-          state.poisoned || state.persistentLoss || unknownWriterPoisoned,
+          states.some((state) => state.poisoned || state.persistentLoss) ||
+          unknownWriterPoisoned,
       };
-      state.turns.add(owner);
+      for (const state of states) state.turns.add(owner);
       let released = false;
       const release = async () => {
-        if (!released) state.turns.delete(owner);
+        if (!released) for (const state of states) state.turns.delete(owner);
         released = true;
-        if (state.turns.size === 0 && !state.persistentLoss)
-          threads.delete(threadId);
+        for (const key of scopeKeys) {
+          const state = scopes.get(key);
+          if (state && state.turns.size === 0 && !state.persistentLoss)
+            scopes.delete(key);
+        }
       };
       return Object.assign(release, {
         async verifyEligibility() {
           return (
             !released &&
             !owner.invalidated &&
-            !state.poisoned &&
-            !state.persistentLoss &&
+            states.every((state) => !state.poisoned && !state.persistentLoss) &&
             !unknownWriterPoisoned
           );
         },
@@ -115,46 +140,25 @@ export function createProcessLocalMemoryAccess(): MastraExclusiveMemoryAccess {
     async markUnsafeWrite(selector) {
       if (!selector) {
         unknownWriterPoisoned = true;
-        for (const state of threads.values()) {
-          state.poisoned = true;
-          state.persistentLoss = true;
-          for (const turn of state.turns) {
-            turn.invalidated = true;
-            turn.onConflict?.();
-          }
-        }
+        poison([...scopes.values()], true);
         return;
       }
-      const { threadId } = selector;
-      const state = threads.get(threadId) ?? {
-        turns: new Set<Turn>(),
-        poisoned: false,
-        persistentLoss: false,
-      };
-      threads.set(threadId, state);
-      state.poisoned = true;
       // The unsafe writer may outlive every current lease. Do not let the
       // final release erase the conflict before that writer quiesces.
-      state.persistentLoss = true;
-      for (const turn of state.turns) {
-        turn.invalidated = true;
-        turn.onConflict?.();
-      }
+      poison(keys(selector).map(getState), true);
     },
     async resetAfterQuiescence(selector) {
       if (!selector) {
-        if ([...threads.values()].some((state) => state.turns.size > 0))
+        if ([...scopes.values()].some((state) => state.turns.size > 0))
           throw new Error("Source-thread writers are still active.");
-        threads.clear();
+        scopes.clear();
         unknownWriterPoisoned = false;
         return;
       }
-      const { threadId } = selector;
-      const state = threads.get(threadId);
-      if (!state) return;
-      if (state.turns.size > 0)
-        throw new Error("Source-thread writers are still active.");
-      threads.delete(threadId);
+      const scopeKeys = keys(selector);
+      if (scopeKeys.some((key) => (scopes.get(key)?.turns.size ?? 0) > 0))
+        throw new Error("Source-thread or resource writers are still active.");
+      for (const key of scopeKeys) scopes.delete(key);
     },
   };
 }

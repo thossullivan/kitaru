@@ -9,7 +9,13 @@ const workerPath = fileURLToPath(
   new URL("./helpers/file-memory-worker.mjs", import.meta.url),
 );
 const thread = { threadId: "shared-thread", resourceId: "resource" };
-const other = { threadId: "other-thread", resourceId: "resource" };
+const sameResource = { threadId: "other-thread", resourceId: "resource" };
+const sameThread = { threadId: "shared-thread", resourceId: "other-resource" };
+const other = { threadId: "other-thread", resourceId: "other-resource" };
+const unrelated = {
+  threadId: "unrelated-thread",
+  resourceId: "unrelated-resource",
+};
 let root: string | undefined;
 const children: ChildProcess[] = [];
 let nextId = 0;
@@ -90,6 +96,56 @@ it("invalidates both processes on bounded same-thread contention, then recovers 
   ).toBe(true);
   await second.request({ action: "release", name: "next", selector: thread });
 });
+
+it.each([
+  ["resource", sameResource],
+  ["thread", sameThread],
+] as const)(
+  "invalidates both processes when selectors share a %s",
+  async (_scope, competing) => {
+    const first = await worker();
+    const second = await worker();
+    expect(
+      await first.request({
+        action: "acquire",
+        name: "first",
+        selector: thread,
+      }),
+    ).toBe(true);
+    expect(
+      await second.request({
+        action: "acquire",
+        name: "competing",
+        selector: competing,
+        waitMs: 40,
+      }),
+    ).toBe(false);
+    expect(await first.request({ action: "verify", name: "first" })).toBe(
+      false,
+    );
+    // Poison is scoped to the conflicting thread and resource, not all turns.
+    expect(
+      await second.request({
+        action: "acquire",
+        name: "other",
+        selector: unrelated,
+      }),
+    ).toBe(true);
+    await Promise.all([
+      first.request({ action: "release", name: "first" }),
+      second.request({ action: "release", name: "competing" }),
+      second.request({ action: "release", name: "other" }),
+    ]);
+    expect(
+      await second.request({
+        action: "acquire",
+        name: "next",
+        selector: thread,
+      }),
+    ).toBe(true);
+    await second.request({ action: "release", name: "next" });
+  },
+);
 
 it("poisons a lost holder before a stale native write and blocks a successor", async () => {
   const first = await worker();
