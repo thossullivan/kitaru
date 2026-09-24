@@ -82,14 +82,7 @@ describe("canonical workflow preflight", () => {
     );
   });
 
-  it.each([
-    "22.22.0",
-    "22.22.3",
-    "24.0.0",
-    "24.18.0",
-    "26.0.0",
-    "26.8.1",
-  ])(
+  it.each(["22.22.0", "22.22.3", "24.0.0", "24.18.0", "26.0.0", "26.8.1"])(
     "accepts supported Node %s",
     (version) => {
       expect(() => assertSupportedNodeVersion(version)).not.toThrow();
